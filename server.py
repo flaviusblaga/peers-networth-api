@@ -1,0 +1,865 @@
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from dotenv import load_dotenv
+from starlette.middleware.cors import CORSMiddleware
+from pymongo import MongoClient
+from pymongo.cursor import Cursor
+# Compatibility shim: pymongo Cursor doesn't have .to_list() like motor does
+Cursor.to_list = lambda self, n: list(self.limit(n))
+import os
+import logging
+from pathlib import Path
+from pydantic import BaseModel, Field, EmailStr
+from typing import List, Optional
+import uuid
+from datetime import datetime, timedelta
+from passlib.context import CryptContext
+from jose import JWTError, jwt
+import base64
+
+ROOT_DIR = Path(__file__).parent
+load_dotenv(ROOT_DIR / '.env')
+
+# MongoDB connection - lazy connect (Passenger fork-safe)
+mongo_url = os.environ['MONGO_URL']
+client = MongoClient(mongo_url, connect=False, serverSelectionTimeoutMS=15000)
+db = client[os.environ.get('DB_NAME', 'networth_db')]
+
+# JWT Configuration
+SECRET_KEY = os.environ.get('SECRET_KEY')
+if not SECRET_KEY:
+    raise ValueError("SECRET_KEY environment variable is required")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 days
+
+# Password hashing
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+security = HTTPBearer()
+
+# Create the main app
+app = FastAPI(title="Peers by NetWorth API")
+api_router = APIRouter(prefix="/api")
+
+# Admin emails - these users will automatically be admins
+ADMIN_EMAILS = ["flaviusblaga@gmail.com"]
+
+# ==================== MODELS ====================
+
+class UserBase(BaseModel):
+    email: EmailStr
+    name: str
+    bio: Optional[str] = ""
+    headline: Optional[str] = ""
+    location: Optional[str] = ""
+    skills: List[str] = []
+    experience: List[dict] = []
+    language: str = "en"  # "en" or "ro"
+    avatar: Optional[str] = None  # base64 image
+
+class UserCreate(UserBase):
+    password: str
+
+class UserLogin(BaseModel):
+    email: EmailStr
+    password: str
+
+class UserUpdate(BaseModel):
+    name: Optional[str] = None
+    bio: Optional[str] = None
+    headline: Optional[str] = None
+    location: Optional[str] = None
+    skills: Optional[List[str]] = None
+    experience: Optional[List[dict]] = None
+    language: Optional[str] = None
+    avatar: Optional[str] = None  # base64 image
+
+class UserResponse(UserBase):
+    id: str
+    created_at: datetime
+    connections_count: int = 0
+    avatar: Optional[str] = None
+    is_admin: bool = False
+    is_blocked: bool = False
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    user: UserResponse
+
+class PostCreate(BaseModel):
+    content: str
+    image: Optional[str] = None  # base64
+    link: Optional[str] = None
+
+class PostResponse(BaseModel):
+    id: str
+    user_id: str
+    user_name: str
+    user_headline: Optional[str] = ""
+    content: str
+    image: Optional[str] = None
+    link: Optional[str] = None
+    likes: List[str] = []
+    comments: List[dict] = []
+    created_at: datetime
+
+class CommentCreate(BaseModel):
+    content: str
+
+class ConnectionRequest(BaseModel):
+    to_user_id: str
+
+class ConnectionResponse(BaseModel):
+    id: str
+    from_user_id: str
+    from_user_name: str
+    from_user_headline: Optional[str] = ""
+    to_user_id: str
+    to_user_name: str
+    to_user_headline: Optional[str] = ""
+    status: str  # pending, accepted, rejected
+    created_at: datetime
+
+class MessageCreate(BaseModel):
+    to_user_id: str
+    content: str
+
+class MessageResponse(BaseModel):
+    id: str
+    from_user_id: str
+    from_user_name: str
+    to_user_id: str
+    to_user_name: str
+    content: str
+    read: bool = False
+    created_at: datetime
+
+class ConversationResponse(BaseModel):
+    user_id: str
+    user_name: str
+    user_headline: Optional[str] = ""
+    last_message: str
+    last_message_time: datetime
+    unread_count: int = 0
+
+# ==================== ADMIN MODELS ====================
+
+class ReportCreate(BaseModel):
+    reported_user_id: Optional[str] = None
+    reported_post_id: Optional[str] = None
+    reason: str
+    description: Optional[str] = ""
+
+class ReportResponse(BaseModel):
+    id: str
+    reporter_id: str
+    reporter_name: str
+    reported_user_id: Optional[str] = None
+    reported_user_name: Optional[str] = None
+    reported_post_id: Optional[str] = None
+    reason: str
+    description: str
+    status: str  # pending, resolved, dismissed
+    created_at: datetime
+
+class AdminStats(BaseModel):
+    total_users: int
+    total_posts: int
+    total_connections: int
+    total_messages: int
+    pending_reports: int
+    blocked_users: int
+    new_users_today: int
+    new_posts_today: int
+
+class AdminUserUpdate(BaseModel):
+    is_admin: Optional[bool] = None
+    is_blocked: Optional[bool] = None
+
+# ==================== HELPERS ====================
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return pwd_context.verify(plain_password, hashed_password)
+
+def get_password_hash(password: str) -> str:
+    return pwd_context.hash(password)
+
+def create_access_token(data: dict) -> str:
+    to_encode = data.copy()
+    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    try:
+        token = credentials.credentials
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id: str = payload.get("sub")
+        if user_id is None:
+            raise HTTPException(status_code=401, detail="Invalid token")
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    
+    user = db.users.find_one({"id": user_id})
+    if user is None:
+        raise HTTPException(status_code=401, detail="User not found")
+    if user.get("is_blocked", False):
+        raise HTTPException(status_code=403, detail="Account is blocked")
+    return user
+
+def get_admin_user(current_user: dict = Depends(get_current_user)):
+    """Verify user is an admin"""
+    is_admin = current_user.get("is_admin", False) or current_user.get("email") in ADMIN_EMAILS
+    if not is_admin:
+        raise HTTPException(status_code=403, detail="Admin access required")
+    return current_user
+
+def get_connections_count(user_id: str) -> int:
+    count = db.connections.count_documents({
+        "$or": [
+            {"from_user_id": user_id, "status": "accepted"},
+            {"to_user_id": user_id, "status": "accepted"}
+        ]
+    })
+    return count
+
+# ==================== AUTH ROUTES ====================
+
+@api_router.post("/auth/register", response_model=TokenResponse)
+def register(user_data: UserCreate):
+    # Check if email exists
+    existing = db.users.find_one({"email": user_data.email})
+    if existing:
+        raise HTTPException(status_code=400, detail="Email already registered")
+    
+    # Create user
+    user_id = str(uuid.uuid4())
+    is_admin = user_data.email in ADMIN_EMAILS
+    user_dict = {
+        "id": user_id,
+        "email": user_data.email,
+        "name": user_data.name,
+        "password_hash": get_password_hash(user_data.password),
+        "bio": user_data.bio or "",
+        "headline": user_data.headline or "",
+        "location": user_data.location or "",
+        "skills": user_data.skills or [],
+        "experience": user_data.experience or [],
+        "language": user_data.language or "en",
+        "is_admin": is_admin,
+        "is_blocked": False,
+        "created_at": datetime.utcnow()
+    }
+    
+    db.users.insert_one(user_dict)
+    
+    # Create token
+    access_token = create_access_token({"sub": user_id})
+    
+    return TokenResponse(
+        access_token=access_token,
+        user=UserResponse(
+            id=user_id,
+            email=user_data.email,
+            name=user_data.name,
+            bio=user_dict["bio"],
+            headline=user_dict["headline"],
+            location=user_dict["location"],
+            skills=user_dict["skills"],
+            experience=user_dict["experience"],
+            language=user_dict["language"],
+            created_at=user_dict["created_at"],
+            connections_count=0,
+            is_admin=is_admin,
+            is_blocked=False
+        )
+    )
+
+@api_router.post("/auth/login", response_model=TokenResponse)
+def login(credentials: UserLogin):
+    user = db.users.find_one({"email": credentials.email})
+    if not user or not verify_password(credentials.password, user["password_hash"]):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    
+    access_token = create_access_token({"sub": user["id"]})
+    connections_count = get_connections_count(user["id"])
+    is_admin = user.get("is_admin", False) or user.get("email") in ADMIN_EMAILS
+    
+    return TokenResponse(
+        access_token=access_token,
+        user=UserResponse(
+            id=user["id"],
+            email=user["email"],
+            name=user["name"],
+            bio=user.get("bio", ""),
+            headline=user.get("headline", ""),
+            location=user.get("location", ""),
+            skills=user.get("skills", []),
+            experience=user.get("experience", []),
+            language=user.get("language", "en"),
+            created_at=user["created_at"],
+            connections_count=connections_count,
+            avatar=user.get("avatar"),
+            is_admin=is_admin,
+            is_blocked=user.get("is_blocked", False)
+        )
+    )
+
+@api_router.get("/auth/me", response_model=UserResponse)
+def get_me(current_user: dict = Depends(get_current_user)):
+    connections_count = get_connections_count(current_user["id"])
+    is_admin = current_user.get("is_admin", False) or current_user.get("email") in ADMIN_EMAILS
+    return UserResponse(
+        id=current_user["id"],
+        email=current_user["email"],
+        name=current_user["name"],
+        bio=current_user.get("bio", ""),
+        headline=current_user.get("headline", ""),
+        location=current_user.get("location", ""),
+        skills=current_user.get("skills", []),
+        experience=current_user.get("experience", []),
+        language=current_user.get("language", "en"),
+        created_at=current_user["created_at"],
+        connections_count=connections_count,
+        avatar=current_user.get("avatar"),
+        is_admin=is_admin,
+        is_blocked=current_user.get("is_blocked", False)
+    )
+
+@api_router.put("/auth/me", response_model=UserResponse)
+def update_me(update_data: UserUpdate, current_user: dict = Depends(get_current_user)):
+    update_dict = {k: v for k, v in update_data.dict().items() if v is not None}
+    if update_dict:
+        db.users.update_one({"id": current_user["id"]}, {"$set": update_dict})
+    
+    updated_user = db.users.find_one({"id": current_user["id"]})
+    connections_count = get_connections_count(current_user["id"])
+    is_admin = updated_user.get("is_admin", False) or updated_user.get("email") in ADMIN_EMAILS
+    
+    return UserResponse(
+        id=updated_user["id"],
+        email=updated_user["email"],
+        name=updated_user["name"],
+        bio=updated_user.get("bio", ""),
+        headline=updated_user.get("headline", ""),
+        location=updated_user.get("location", ""),
+        skills=updated_user.get("skills", []),
+        experience=updated_user.get("experience", []),
+        language=updated_user.get("language", "en"),
+        created_at=updated_user["created_at"],
+        connections_count=connections_count,
+        avatar=updated_user.get("avatar"),
+        is_admin=is_admin,
+        is_blocked=updated_user.get("is_blocked", False)
+    )
+
+# ==================== USER ROUTES ====================
+
+@api_router.get("/users", response_model=List[UserResponse])
+def get_users(search: Optional[str] = None, current_user: dict = Depends(get_current_user)):
+    query = {"id": {"$ne": current_user["id"]}, "is_blocked": {"$ne": True}}
+    if search:
+        query["$or"] = [
+            {"name": {"$regex": search, "$options": "i"}},
+            {"headline": {"$regex": search, "$options": "i"}},
+            {"skills": {"$elemMatch": {"$regex": search, "$options": "i"}}}
+        ]
+    
+    users = list(db.users.find(query).limit(100))
+    result = []
+    for user in users:
+        connections_count = get_connections_count(user["id"])
+        is_admin = user.get("is_admin", False) or user.get("email") in ADMIN_EMAILS
+        result.append(UserResponse(
+            id=user["id"],
+            email=user["email"],
+            name=user["name"],
+            bio=user.get("bio", ""),
+            headline=user.get("headline", ""),
+            location=user.get("location", ""),
+            skills=user.get("skills", []),
+            experience=user.get("experience", []),
+            language=user.get("language", "en"),
+            created_at=user["created_at"],
+            connections_count=connections_count
+        ))
+    return result
+
+@api_router.get("/users/{user_id}", response_model=UserResponse)
+def get_user(user_id: str, current_user: dict = Depends(get_current_user)):
+    user = db.users.find_one({"id": user_id})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    connections_count = get_connections_count(user["id"])
+    return UserResponse(
+        id=user["id"],
+        email=user["email"],
+        name=user["name"],
+        bio=user.get("bio", ""),
+        headline=user.get("headline", ""),
+        location=user.get("location", ""),
+        skills=user.get("skills", []),
+        experience=user.get("experience", []),
+        language=user.get("language", "en"),
+        created_at=user["created_at"],
+        connections_count=connections_count
+    )
+
+# ==================== POST ROUTES ====================
+
+@api_router.post("/posts", response_model=PostResponse)
+def create_post(post_data: PostCreate, current_user: dict = Depends(get_current_user)):
+    post_id = str(uuid.uuid4())
+    post_dict = {
+        "id": post_id,
+        "user_id": current_user["id"],
+        "user_name": current_user["name"],
+        "user_headline": current_user.get("headline", ""),
+        "content": post_data.content,
+        "image": post_data.image,
+        "link": post_data.link,
+        "likes": [],
+        "comments": [],
+        "created_at": datetime.utcnow()
+    }
+    db.posts.insert_one(post_dict)
+    return PostResponse(**post_dict)
+
+@api_router.get("/posts", response_model=List[PostResponse])
+def get_posts(current_user: dict = Depends(get_current_user)):
+    # Get user's connections
+    connections = db.connections.find({
+        "$or": [
+            {"from_user_id": current_user["id"], "status": "accepted"},
+            {"to_user_id": current_user["id"], "status": "accepted"}
+        ]
+    }).to_list(1000)
+    
+    connection_ids = set()
+    for conn in connections:
+        if conn["from_user_id"] == current_user["id"]:
+            connection_ids.add(conn["to_user_id"])
+        else:
+            connection_ids.add(conn["from_user_id"])
+    
+    # Include own posts and connections' posts
+    connection_ids.add(current_user["id"])
+    
+    posts = list(db.posts.find({"user_id": {"$in": list(connection_ids)}}).sort("created_at", -1).limit(100))
+    return [PostResponse(**post) for post in posts]
+
+@api_router.get("/posts/all", response_model=List[PostResponse])
+def get_all_posts(current_user: dict = Depends(get_current_user)):
+    posts = list(db.posts.find().sort("created_at", -1).limit(100))
+    return [PostResponse(**post) for post in posts]
+
+@api_router.get("/posts/user/{user_id}", response_model=List[PostResponse])
+def get_user_posts(user_id: str, current_user: dict = Depends(get_current_user)):
+    posts = list(db.posts.find({"user_id": user_id}).sort("created_at", -1).limit(100))
+    return [PostResponse(**post) for post in posts]
+
+@api_router.post("/posts/{post_id}/like")
+def like_post(post_id: str, current_user: dict = Depends(get_current_user)):
+    post = db.posts.find_one({"id": post_id})
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    
+    if current_user["id"] in post.get("likes", []):
+        # Unlike
+        db.posts.update_one({"id": post_id}, {"$pull": {"likes": current_user["id"]}})
+        return {"message": "Unliked", "liked": False}
+    else:
+        # Like
+        db.posts.update_one({"id": post_id}, {"$push": {"likes": current_user["id"]}})
+        return {"message": "Liked", "liked": True}
+
+@api_router.post("/posts/{post_id}/comment", response_model=PostResponse)
+def add_comment(post_id: str, comment_data: CommentCreate, current_user: dict = Depends(get_current_user)):
+    post = db.posts.find_one({"id": post_id})
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    
+    comment = {
+        "id": str(uuid.uuid4()),
+        "user_id": current_user["id"],
+        "user_name": current_user["name"],
+        "content": comment_data.content,
+        "created_at": datetime.utcnow().isoformat()
+    }
+    
+    db.posts.update_one({"id": post_id}, {"$push": {"comments": comment}})
+    updated_post = db.posts.find_one({"id": post_id})
+    return PostResponse(**updated_post)
+
+@api_router.delete("/posts/{post_id}")
+def delete_post(post_id: str, current_user: dict = Depends(get_current_user)):
+    post = db.posts.find_one({"id": post_id})
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    if post["user_id"] != current_user["id"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    
+    db.posts.delete_one({"id": post_id})
+    return {"message": "Post deleted"}
+
+# ==================== CONNECTION ROUTES ====================
+
+@api_router.post("/connections", response_model=ConnectionResponse)
+def create_connection_request(request: ConnectionRequest, current_user: dict = Depends(get_current_user)):
+    # Check if connection already exists
+    existing = db.connections.find_one({
+        "$or": [
+            {"from_user_id": current_user["id"], "to_user_id": request.to_user_id},
+            {"from_user_id": request.to_user_id, "to_user_id": current_user["id"]}
+        ]
+    })
+    if existing:
+        raise HTTPException(status_code=400, detail="Connection request already exists")
+    
+    to_user = db.users.find_one({"id": request.to_user_id})
+    if not to_user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    conn_id = str(uuid.uuid4())
+    conn_dict = {
+        "id": conn_id,
+        "from_user_id": current_user["id"],
+        "from_user_name": current_user["name"],
+        "from_user_headline": current_user.get("headline", ""),
+        "to_user_id": request.to_user_id,
+        "to_user_name": to_user["name"],
+        "to_user_headline": to_user.get("headline", ""),
+        "status": "pending",
+        "created_at": datetime.utcnow()
+    }
+    
+    db.connections.insert_one(conn_dict)
+    return ConnectionResponse(**conn_dict)
+
+@api_router.get("/connections", response_model=List[ConnectionResponse])
+def get_connections(current_user: dict = Depends(get_current_user)):
+    connections = db.connections.find({
+        "$or": [
+            {"from_user_id": current_user["id"], "status": "accepted"},
+            {"to_user_id": current_user["id"], "status": "accepted"}
+        ]
+    }).to_list(1000)
+    return [ConnectionResponse(**conn) for conn in connections]
+
+@api_router.get("/connections/pending", response_model=List[ConnectionResponse])
+def get_pending_connections(current_user: dict = Depends(get_current_user)):
+    connections = db.connections.find({
+        "to_user_id": current_user["id"],
+        "status": "pending"
+    }).to_list(100)
+    return [ConnectionResponse(**conn) for conn in connections]
+
+@api_router.get("/connections/sent", response_model=List[ConnectionResponse])
+def get_sent_connections(current_user: dict = Depends(get_current_user)):
+    connections = db.connections.find({
+        "from_user_id": current_user["id"],
+        "status": "pending"
+    }).to_list(100)
+    return [ConnectionResponse(**conn) for conn in connections]
+
+@api_router.put("/connections/{connection_id}/accept")
+def accept_connection(connection_id: str, current_user: dict = Depends(get_current_user)):
+    connection = db.connections.find_one({"id": connection_id})
+    if not connection:
+        raise HTTPException(status_code=404, detail="Connection not found")
+    if connection["to_user_id"] != current_user["id"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    
+    db.connections.update_one({"id": connection_id}, {"$set": {"status": "accepted"}})
+    return {"message": "Connection accepted"}
+
+@api_router.put("/connections/{connection_id}/reject")
+def reject_connection(connection_id: str, current_user: dict = Depends(get_current_user)):
+    connection = db.connections.find_one({"id": connection_id})
+    if not connection:
+        raise HTTPException(status_code=404, detail="Connection not found")
+    if connection["to_user_id"] != current_user["id"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    
+    db.connections.delete_one({"id": connection_id})
+    return {"message": "Connection rejected"}
+
+@api_router.delete("/connections/{user_id}")
+def remove_connection(user_id: str, current_user: dict = Depends(get_current_user)):
+    result = db.connections.delete_one({
+        "$or": [
+            {"from_user_id": current_user["id"], "to_user_id": user_id, "status": "accepted"},
+            {"from_user_id": user_id, "to_user_id": current_user["id"], "status": "accepted"}
+        ]
+    })
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Connection not found")
+    return {"message": "Connection removed"}
+
+@api_router.get("/connections/status/{user_id}")
+def get_connection_status(user_id: str, current_user: dict = Depends(get_current_user)):
+    connection = db.connections.find_one({
+        "$or": [
+            {"from_user_id": current_user["id"], "to_user_id": user_id},
+            {"from_user_id": user_id, "to_user_id": current_user["id"]}
+        ]
+    })
+    
+    if not connection:
+        return {"status": "none", "connection_id": None}
+    
+    is_sender = connection["from_user_id"] == current_user["id"]
+    return {
+        "status": connection["status"],
+        "connection_id": connection["id"],
+        "is_sender": is_sender
+    }
+
+# ==================== MESSAGE ROUTES ====================
+
+@api_router.post("/messages", response_model=MessageResponse)
+def send_message(message_data: MessageCreate, current_user: dict = Depends(get_current_user)):
+    to_user = db.users.find_one({"id": message_data.to_user_id})
+    if not to_user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    msg_id = str(uuid.uuid4())
+    msg_dict = {
+        "id": msg_id,
+        "from_user_id": current_user["id"],
+        "from_user_name": current_user["name"],
+        "to_user_id": message_data.to_user_id,
+        "to_user_name": to_user["name"],
+        "content": message_data.content,
+        "read": False,
+        "created_at": datetime.utcnow()
+    }
+    
+    db.messages.insert_one(msg_dict)
+    return MessageResponse(**msg_dict)
+
+@api_router.get("/messages/conversations", response_model=List[ConversationResponse])
+def get_conversations(current_user: dict = Depends(get_current_user)):
+    # Get all messages involving the user
+    messages = db.messages.find({
+        "$or": [
+            {"from_user_id": current_user["id"]},
+            {"to_user_id": current_user["id"]}
+        ]
+    }).list(sort("created_at", -1).limit(1000))
+    
+    conversations = {}
+    for msg in messages:
+        other_user_id = msg["to_user_id"] if msg["from_user_id"] == current_user["id"] else msg["from_user_id"]
+        other_user_name = msg["to_user_name"] if msg["from_user_id"] == current_user["id"] else msg["from_user_name"]
+        
+        if other_user_id not in conversations:
+            # Get user headline
+            other_user = db.users.find_one({"id": other_user_id})
+            headline = other_user.get("headline", "") if other_user else ""
+            
+            # Count unread
+            unread = db.messages.count_documents({
+                "from_user_id": other_user_id,
+                "to_user_id": current_user["id"],
+                "read": False
+            })
+            
+            conversations[other_user_id] = ConversationResponse(
+                user_id=other_user_id,
+                user_name=other_user_name,
+                user_headline=headline,
+                last_message=msg["content"],
+                last_message_time=msg["created_at"],
+                unread_count=unread
+            )
+    
+    return list(conversations.values())
+
+@api_router.get("/messages/{user_id}", response_model=List[MessageResponse])
+def get_messages_with_user(user_id: str, current_user: dict = Depends(get_current_user)):
+    messages = db.messages.find({
+        "$or": [
+            {"from_user_id": current_user["id"], "to_user_id": user_id},
+            {"from_user_id": user_id, "to_user_id": current_user["id"]}
+        ]
+    }).list(sort("created_at", 1).limit(1000))
+    
+    # Mark messages as read
+    db.messages.update_many(
+        {"from_user_id": user_id, "to_user_id": current_user["id"], "read": False},
+        {"$set": {"read": True}}
+    )
+    
+    return [MessageResponse(**msg) for msg in messages]
+
+# ==================== HEALTH CHECK ====================
+
+@api_router.get("/health")
+def health_check():
+    return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
+
+# ==================== ADMIN ROUTES ====================
+
+@api_router.get("/admin/stats", response_model=AdminStats)
+def get_admin_stats(admin_user: dict = Depends(get_admin_user)):
+    today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    
+    total_users = db.users.count_documents({})
+    total_posts = db.posts.count_documents({})
+    total_connections = db.connections.count_documents({"status": "accepted"})
+    total_messages = db.messages.count_documents({})
+    pending_reports = db.reports.count_documents({"status": "pending"})
+    blocked_users = db.users.count_documents({"is_blocked": True})
+    new_users_today = db.users.count_documents({"created_at": {"$gte": today}})
+    new_posts_today = db.posts.count_documents({"created_at": {"$gte": today}})
+    
+    return AdminStats(
+        total_users=total_users,
+        total_posts=total_posts,
+        total_connections=total_connections,
+        total_messages=total_messages,
+        pending_reports=pending_reports,
+        blocked_users=blocked_users,
+        new_users_today=new_users_today,
+        new_posts_today=new_posts_today
+    )
+
+@api_router.get("/admin/users", response_model=List[UserResponse])
+def get_all_users_admin(admin_user: dict = Depends(get_admin_user)):
+    users = list(db.users.find().sort("created_at", -1).limit(500))
+    result = []
+    for user in users:
+        connections_count = get_connections_count(user["id"])
+        is_admin = user.get("is_admin", False) or user.get("email") in ADMIN_EMAILS
+        result.append(UserResponse(
+            id=user["id"],
+            email=user["email"],
+            name=user["name"],
+            bio=user.get("bio", ""),
+            headline=user.get("headline", ""),
+            location=user.get("location", ""),
+            skills=user.get("skills", []),
+            experience=user.get("experience", []),
+            language=user.get("language", "en"),
+            created_at=user["created_at"],
+            connections_count=connections_count,
+            avatar=user.get("avatar"),
+            is_admin=is_admin,
+            is_blocked=user.get("is_blocked", False)
+        ))
+    return result
+
+@api_router.put("/admin/users/{user_id}")
+def update_user_admin(user_id: str, update_data: AdminUserUpdate, admin_user: dict = Depends(get_admin_user)):
+    user = db.users.find_one({"id": user_id})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    update_dict = {}
+    if update_data.is_admin is not None:
+        update_dict["is_admin"] = update_data.is_admin
+    if update_data.is_blocked is not None:
+        update_dict["is_blocked"] = update_data.is_blocked
+    
+    if update_dict:
+        db.users.update_one({"id": user_id}, {"$set": update_dict})
+    
+    return {"message": "User updated successfully"}
+
+@api_router.delete("/admin/users/{user_id}")
+def delete_user_admin(user_id: str, admin_user: dict = Depends(get_admin_user)):
+    user = db.users.find_one({"id": user_id})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    # Delete user and all their data
+    db.users.delete_one({"id": user_id})
+    db.posts.delete_many({"user_id": user_id})
+    db.connections.delete_many({"$or": [{"from_user_id": user_id}, {"to_user_id": user_id}]})
+    db.messages.delete_many({"$or": [{"from_user_id": user_id}, {"to_user_id": user_id}]})
+    
+    return {"message": "User deleted successfully"}
+
+@api_router.get("/admin/posts")
+def get_all_posts_admin(admin_user: dict = Depends(get_admin_user)):
+    posts = list(db.posts.find().sort("created_at", -1).limit(500))
+    return posts
+
+@api_router.delete("/admin/posts/{post_id}")
+def delete_post_admin(post_id: str, admin_user: dict = Depends(get_admin_user)):
+    post = db.posts.find_one({"id": post_id})
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    
+    db.posts.delete_one({"id": post_id})
+    return {"message": "Post deleted successfully"}
+
+@api_router.post("/reports", response_model=ReportResponse)
+def create_report(report_data: ReportCreate, current_user: dict = Depends(get_current_user)):
+    report_id = str(uuid.uuid4())
+    
+    reported_user_name = None
+    if report_data.reported_user_id:
+        reported_user = db.users.find_one({"id": report_data.reported_user_id})
+        reported_user_name = reported_user["name"] if reported_user else None
+    
+    report_dict = {
+        "id": report_id,
+        "reporter_id": current_user["id"],
+        "reporter_name": current_user["name"],
+        "reported_user_id": report_data.reported_user_id,
+        "reported_user_name": reported_user_name,
+        "reported_post_id": report_data.reported_post_id,
+        "reason": report_data.reason,
+        "description": report_data.description or "",
+        "status": "pending",
+        "created_at": datetime.utcnow()
+    }
+    
+    db.reports.insert_one(report_dict)
+    return ReportResponse(**report_dict)
+
+@api_router.get("/admin/reports", response_model=List[ReportResponse])
+def get_reports_admin(status: Optional[str] = None, admin_user: dict = Depends(get_admin_user)):
+    query = {}
+    if status:
+        query["status"] = status
+    
+    reports = list(db.reports.find(query).sort("created_at", -1).limit(200))
+    return [ReportResponse(**report) for report in reports]
+
+@api_router.put("/admin/reports/{report_id}")
+def update_report_admin(report_id: str, status: str, admin_user: dict = Depends(get_admin_user)):
+    report = db.reports.find_one({"id": report_id})
+    if not report:
+        raise HTTPException(status_code=404, detail="Report not found")
+    
+    if status not in ["pending", "resolved", "dismissed"]:
+        raise HTTPException(status_code=400, detail="Invalid status")
+    
+    db.reports.update_one({"id": report_id}, {"$set": {"status": status}})
+    return {"message": "Report updated successfully"}
+
+# Include the router
+app.include_router(api_router)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_credentials=True,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+@app.on_event("shutdown")
+def shutdown_db_client():
+    client.close()
