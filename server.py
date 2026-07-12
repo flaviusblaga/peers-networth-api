@@ -642,12 +642,12 @@ def send_message(message_data: MessageCreate, current_user: dict = Depends(get_c
 @api_router.get("/messages/conversations", response_model=List[ConversationResponse])
 def get_conversations(current_user: dict = Depends(get_current_user)):
     # Get all messages involving the user
-    messages = db.messages.find({
+    messages = list(db.messages.find({
         "$or": [
             {"from_user_id": current_user["id"]},
             {"to_user_id": current_user["id"]}
         ]
-    }).list(sort("created_at", -1).limit(1000))
+    }).sort("created_at", -1).limit(1000))
     
     conversations = {}
     for msg in messages:
@@ -679,12 +679,12 @@ def get_conversations(current_user: dict = Depends(get_current_user)):
 
 @api_router.get("/messages/{user_id}", response_model=List[MessageResponse])
 def get_messages_with_user(user_id: str, current_user: dict = Depends(get_current_user)):
-    messages = db.messages.find({
+    messages = list(db.messages.find({
         "$or": [
             {"from_user_id": current_user["id"], "to_user_id": user_id},
             {"from_user_id": user_id, "to_user_id": current_user["id"]}
         ]
-    }).list(sort("created_at", 1).limit(1000))
+    }).sort("created_at", 1).limit(1000))
     
     # Mark messages as read
     db.messages.update_many(
