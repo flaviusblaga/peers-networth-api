@@ -142,6 +142,48 @@ class ConversationResponse(BaseModel):
     last_message_time: datetime
     unread_count: int = 0
 
+# ==================== GROUP MODELS ====================
+
+class GroupCreate(BaseModel):
+    name: str
+    member_ids: List[str] = []
+
+class GroupUpdate(BaseModel):
+    name: Optional[str] = None
+
+class GroupMemberInfo(BaseModel):
+    id: str
+    name: str
+    avatar: Optional[str] = None
+    headline: Optional[str] = ""
+
+class GroupResponse(BaseModel):
+    id: str
+    name: str
+    owner_id: str
+    owner_name: str
+    members: List[GroupMemberInfo] = []
+    member_count: int = 0
+    last_message: Optional[str] = None
+    last_message_time: Optional[datetime] = None
+    unread_count: int = 0
+    created_at: datetime
+
+class GroupMessageCreate(BaseModel):
+    content: str
+
+class GroupMessageResponse(BaseModel):
+    id: str
+    group_id: str
+    from_user_id: str
+    from_user_name: str
+    from_user_avatar: Optional[str] = None
+    content: str
+    created_at: datetime
+
+class GroupMembersAdd(BaseModel):
+    user_ids: List[str]
+
 # ==================== ADMIN MODELS ====================
 
 class ReportCreate(BaseModel):
@@ -693,6 +735,261 @@ def get_messages_with_user(user_id: str, current_user: dict = Depends(get_curren
     )
     
     return [MessageResponse(**msg) for msg in messages]
+
+# ==================== GROUP CHAT ROUTES ====================
+
+def _serialize_group(group: dict, current_user_id: str) -> GroupResponse:
+    """Convert DB group document to GroupResponse."""
+    member_ids = group.get("member_ids", [])
+    members_docs = list(db.users.find(
+        {"id": {"$in": member_ids}},
+        {"id": 1, "name": 1, "avatar": 1, "headline": 1, "_id": 0}
+    ))
+    members = [
+        GroupMemberInfo(
+            id=m["id"],
+            name=m.get("name", ""),
+            avatar=m.get("avatar"),
+            headline=m.get("headline", "")
+        )
+        for m in members_docs
+    ]
+    owner = db.users.find_one({"id": group["owner_id"]}, {"name": 1})
+    owner_name = owner.get("name", "") if owner else ""
+
+    last_msg_doc = db.group_messages.find_one(
+        {"group_id": group["id"]},
+        sort=[("created_at", -1)]
+    )
+    last_message = last_msg_doc["content"] if last_msg_doc else None
+    last_message_time = last_msg_doc["created_at"] if last_msg_doc else None
+
+    # Unread count: messages after current user's last-read timestamp
+    reads = group.get("read_state", {}) or {}
+    last_read = reads.get(current_user_id)
+    unread_filter = {"group_id": group["id"], "from_user_id": {"$ne": current_user_id}}
+    if last_read:
+        unread_filter["created_at"] = {"$gt": last_read}
+    unread_count = db.group_messages.count_documents(unread_filter)
+
+    return GroupResponse(
+        id=group["id"],
+        name=group["name"],
+        owner_id=group["owner_id"],
+        owner_name=owner_name,
+        members=members,
+        member_count=len(member_ids),
+        last_message=last_message,
+        last_message_time=last_message_time,
+        unread_count=unread_count,
+        created_at=group["created_at"],
+    )
+
+
+@api_router.post("/groups", response_model=GroupResponse)
+def create_group(payload: GroupCreate, current_user: dict = Depends(get_current_user)):
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Group name is required")
+    if len(name) > 60:
+        raise HTTPException(status_code=400, detail="Group name too long")
+
+    # Sanitize member ids: must be connected to current user (accepted connection) or the user themselves
+    member_ids = list({mid for mid in payload.member_ids if mid and mid != current_user["id"]})
+    if member_ids:
+        connected = db.connections.find({
+            "$or": [
+                {"from_user_id": current_user["id"], "to_user_id": {"$in": member_ids}, "status": "accepted"},
+                {"to_user_id": current_user["id"], "from_user_id": {"$in": member_ids}, "status": "accepted"},
+            ]
+        })
+        allowed = set()
+        for conn in connected:
+            allowed.add(conn["to_user_id"] if conn["from_user_id"] == current_user["id"] else conn["from_user_id"])
+        member_ids = [m for m in member_ids if m in allowed]
+
+    # Always include the owner
+    all_members = list({current_user["id"], *member_ids})
+
+    group_id = str(uuid.uuid4())
+    now = datetime.utcnow()
+    group_doc = {
+        "id": group_id,
+        "name": name,
+        "owner_id": current_user["id"],
+        "member_ids": all_members,
+        "read_state": {current_user["id"]: now},
+        "created_at": now,
+    }
+    db.groups.insert_one(group_doc)
+    return _serialize_group(group_doc, current_user["id"])
+
+
+@api_router.get("/groups", response_model=List[GroupResponse])
+def list_my_groups(current_user: dict = Depends(get_current_user)):
+    groups = list(db.groups.find({"member_ids": current_user["id"]}).sort("created_at", -1).limit(200))
+    result = [_serialize_group(g, current_user["id"]) for g in groups]
+    # Sort by last_message_time desc, then by created_at desc
+    result.sort(key=lambda g: (g.last_message_time or g.created_at), reverse=True)
+    return result
+
+
+@api_router.get("/groups/{group_id}", response_model=GroupResponse)
+def get_group(group_id: str, current_user: dict = Depends(get_current_user)):
+    group = db.groups.find_one({"id": group_id})
+    if not group:
+        raise HTTPException(status_code=404, detail="Group not found")
+    if current_user["id"] not in group.get("member_ids", []):
+        raise HTTPException(status_code=403, detail="You are not a member of this group")
+    return _serialize_group(group, current_user["id"])
+
+
+@api_router.put("/groups/{group_id}", response_model=GroupResponse)
+def update_group(group_id: str, payload: GroupUpdate, current_user: dict = Depends(get_current_user)):
+    group = db.groups.find_one({"id": group_id})
+    if not group:
+        raise HTTPException(status_code=404, detail="Group not found")
+    if group["owner_id"] != current_user["id"]:
+        raise HTTPException(status_code=403, detail="Only the group owner can update it")
+    updates = {}
+    if payload.name is not None:
+        name = payload.name.strip()
+        if not name:
+            raise HTTPException(status_code=400, detail="Group name cannot be empty")
+        if len(name) > 60:
+            raise HTTPException(status_code=400, detail="Group name too long")
+        updates["name"] = name
+    if updates:
+        db.groups.update_one({"id": group_id}, {"$set": updates})
+        group.update(updates)
+    return _serialize_group(group, current_user["id"])
+
+
+@api_router.delete("/groups/{group_id}")
+def delete_group(group_id: str, current_user: dict = Depends(get_current_user)):
+    group = db.groups.find_one({"id": group_id})
+    if not group:
+        raise HTTPException(status_code=404, detail="Group not found")
+    if group["owner_id"] != current_user["id"]:
+        raise HTTPException(status_code=403, detail="Only the group owner can delete it")
+    db.groups.delete_one({"id": group_id})
+    db.group_messages.delete_many({"group_id": group_id})
+    return {"success": True}
+
+
+@api_router.post("/groups/{group_id}/members", response_model=GroupResponse)
+def add_members(group_id: str, payload: GroupMembersAdd, current_user: dict = Depends(get_current_user)):
+    group = db.groups.find_one({"id": group_id})
+    if not group:
+        raise HTTPException(status_code=404, detail="Group not found")
+    if current_user["id"] not in group.get("member_ids", []):
+        raise HTTPException(status_code=403, detail="You are not a member of this group")
+
+    new_ids = [uid for uid in payload.user_ids if uid and uid not in group.get("member_ids", [])]
+    if new_ids:
+        # Only allow users that current user is connected with
+        connected = db.connections.find({
+            "$or": [
+                {"from_user_id": current_user["id"], "to_user_id": {"$in": new_ids}, "status": "accepted"},
+                {"to_user_id": current_user["id"], "from_user_id": {"$in": new_ids}, "status": "accepted"},
+            ]
+        })
+        allowed = set()
+        for conn in connected:
+            allowed.add(conn["to_user_id"] if conn["from_user_id"] == current_user["id"] else conn["from_user_id"])
+        new_ids = [uid for uid in new_ids if uid in allowed]
+
+    if new_ids:
+        db.groups.update_one(
+            {"id": group_id},
+            {"$addToSet": {"member_ids": {"$each": new_ids}}}
+        )
+        group["member_ids"] = list({*group.get("member_ids", []), *new_ids})
+    return _serialize_group(group, current_user["id"])
+
+
+@api_router.delete("/groups/{group_id}/members/{user_id}", response_model=GroupResponse)
+def remove_member(group_id: str, user_id: str, current_user: dict = Depends(get_current_user)):
+    group = db.groups.find_one({"id": group_id})
+    if not group:
+        raise HTTPException(status_code=404, detail="Group not found")
+    if current_user["id"] not in group.get("member_ids", []):
+        raise HTTPException(status_code=403, detail="You are not a member of this group")
+
+    is_owner = group["owner_id"] == current_user["id"]
+    is_self = user_id == current_user["id"]
+
+    if not is_owner and not is_self:
+        raise HTTPException(status_code=403, detail="Only the owner can remove other members")
+
+    if is_owner and is_self:
+        # Owner leaves: transfer ownership to next member, or delete if last
+        remaining = [m for m in group.get("member_ids", []) if m != user_id]
+        if remaining:
+            db.groups.update_one(
+                {"id": group_id},
+                {"$set": {"owner_id": remaining[0]}, "$pull": {"member_ids": user_id}}
+            )
+        else:
+            db.groups.delete_one({"id": group_id})
+            db.group_messages.delete_many({"group_id": group_id})
+            return {"id": group_id, "name": group["name"], "owner_id": user_id,
+                    "owner_name": current_user.get("name", ""), "members": [],
+                    "member_count": 0, "created_at": group["created_at"]}
+    else:
+        db.groups.update_one({"id": group_id}, {"$pull": {"member_ids": user_id}})
+
+    group = db.groups.find_one({"id": group_id})
+    return _serialize_group(group, current_user["id"])
+
+
+@api_router.get("/groups/{group_id}/messages", response_model=List[GroupMessageResponse])
+def get_group_messages(group_id: str, current_user: dict = Depends(get_current_user)):
+    group = db.groups.find_one({"id": group_id})
+    if not group:
+        raise HTTPException(status_code=404, detail="Group not found")
+    if current_user["id"] not in group.get("member_ids", []):
+        raise HTTPException(status_code=403, detail="You are not a member of this group")
+
+    messages = list(db.group_messages.find({"group_id": group_id}).sort("created_at", 1).limit(1000))
+    # Mark as read for this user
+    db.groups.update_one(
+        {"id": group_id},
+        {"$set": {f"read_state.{current_user['id']}": datetime.utcnow()}}
+    )
+    return [GroupMessageResponse(**m) for m in messages]
+
+
+@api_router.post("/groups/{group_id}/messages", response_model=GroupMessageResponse)
+def send_group_message(group_id: str, payload: GroupMessageCreate, current_user: dict = Depends(get_current_user)):
+    group = db.groups.find_one({"id": group_id})
+    if not group:
+        raise HTTPException(status_code=404, detail="Group not found")
+    if current_user["id"] not in group.get("member_ids", []):
+        raise HTTPException(status_code=403, detail="You are not a member of this group")
+
+    content = payload.content.strip()
+    if not content:
+        raise HTTPException(status_code=400, detail="Message content is required")
+
+    msg = {
+        "id": str(uuid.uuid4()),
+        "group_id": group_id,
+        "from_user_id": current_user["id"],
+        "from_user_name": current_user.get("name", ""),
+        "from_user_avatar": current_user.get("avatar"),
+        "content": content,
+        "created_at": datetime.utcnow(),
+    }
+    db.group_messages.insert_one(msg)
+    # Update sender's read timestamp
+    db.groups.update_one(
+        {"id": group_id},
+        {"$set": {f"read_state.{current_user['id']}": msg["created_at"]}}
+    )
+    msg.pop("_id", None)
+    return GroupMessageResponse(**msg)
+
 
 # ==================== HEALTH CHECK ====================
 
