@@ -115,9 +115,11 @@ class ConnectionResponse(BaseModel):
     from_user_id: str
     from_user_name: str
     from_user_headline: Optional[str] = ""
+    from_user_avatar: Optional[str] = None
     to_user_id: str
     to_user_name: str
     to_user_headline: Optional[str] = ""
+    to_user_avatar: Optional[str] = None
     status: str  # pending, accepted, rejected
     created_at: datetime
 
@@ -582,6 +584,28 @@ def delete_post(post_id: str, current_user: dict = Depends(get_current_user)):
 
 # ==================== CONNECTION ROUTES ====================
 
+# ==================== CONNECTION ROUTES ====================
+
+def _enrich_connection_avatars(connections: list) -> list:
+    """Attach from_user_avatar and to_user_avatar to connection dicts."""
+    if not connections:
+        return []
+    user_ids = set()
+    for c in connections:
+        user_ids.add(c.get("from_user_id"))
+        user_ids.add(c.get("to_user_id"))
+    user_ids.discard(None)
+    users_cursor = db.users.find(
+        {"id": {"$in": list(user_ids)}},
+        {"id": 1, "avatar": 1, "_id": 0}
+    )
+    avatar_map = {u["id"]: u.get("avatar") for u in users_cursor}
+    for c in connections:
+        c["from_user_avatar"] = avatar_map.get(c.get("from_user_id"))
+        c["to_user_avatar"] = avatar_map.get(c.get("to_user_id"))
+    return connections
+
+
 @api_router.post("/connections", response_model=ConnectionResponse)
 def create_connection_request(request: ConnectionRequest, current_user: dict = Depends(get_current_user)):
     # Check if connection already exists
@@ -612,6 +636,8 @@ def create_connection_request(request: ConnectionRequest, current_user: dict = D
     }
     
     db.connections.insert_one(conn_dict)
+    conn_dict["from_user_avatar"] = current_user.get("avatar")
+    conn_dict["to_user_avatar"] = to_user.get("avatar")
     return ConnectionResponse(**conn_dict)
 
 @api_router.get("/connections", response_model=List[ConnectionResponse])
@@ -622,6 +648,7 @@ def get_connections(current_user: dict = Depends(get_current_user)):
             {"to_user_id": current_user["id"], "status": "accepted"}
         ]
     }).to_list(1000)
+    connections = _enrich_connection_avatars(connections)
     return [ConnectionResponse(**conn) for conn in connections]
 
 @api_router.get("/connections/pending", response_model=List[ConnectionResponse])
@@ -630,6 +657,7 @@ def get_pending_connections(current_user: dict = Depends(get_current_user)):
         "to_user_id": current_user["id"],
         "status": "pending"
     }).to_list(100)
+    connections = _enrich_connection_avatars(connections)
     return [ConnectionResponse(**conn) for conn in connections]
 
 @api_router.get("/connections/sent", response_model=List[ConnectionResponse])
@@ -638,6 +666,7 @@ def get_sent_connections(current_user: dict = Depends(get_current_user)):
         "from_user_id": current_user["id"],
         "status": "pending"
     }).to_list(100)
+    connections = _enrich_connection_avatars(connections)
     return [ConnectionResponse(**conn) for conn in connections]
 
 @api_router.put("/connections/{connection_id}/accept")
