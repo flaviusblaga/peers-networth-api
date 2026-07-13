@@ -437,7 +437,8 @@ def get_users(search: Optional[str] = None, current_user: dict = Depends(get_cur
             experience=user.get("experience", []),
             language=user.get("language", "en"),
             created_at=user["created_at"],
-            connections_count=connections_count
+            connections_count=connections_count,
+            avatar=user.get("avatar")
         ))
     return result
 
@@ -459,7 +460,8 @@ def get_user(user_id: str, current_user: dict = Depends(get_current_user)):
         experience=user.get("experience", []),
         language=user.get("language", "en"),
         created_at=user["created_at"],
-        connections_count=connections_count
+        connections_count=connections_count,
+        avatar=user.get("avatar")
     )
 
 # ==================== POST ROUTES ====================
