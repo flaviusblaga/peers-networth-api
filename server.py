@@ -96,6 +96,7 @@ class PostResponse(BaseModel):
     user_id: str
     user_name: str
     user_headline: Optional[str] = ""
+    user_avatar: Optional[str] = None
     content: str
     image: Optional[str] = None
     link: Optional[str] = None
@@ -147,9 +148,11 @@ class ConversationResponse(BaseModel):
 class GroupCreate(BaseModel):
     name: str
     member_ids: List[str] = []
+    avatar: Optional[str] = None
 
 class GroupUpdate(BaseModel):
     name: Optional[str] = None
+    avatar: Optional[str] = None
 
 class GroupMemberInfo(BaseModel):
     id: str
@@ -160,6 +163,7 @@ class GroupMemberInfo(BaseModel):
 class GroupResponse(BaseModel):
     id: str
     name: str
+    avatar: Optional[str] = None
     owner_id: str
     owner_name: str
     members: List[GroupMemberInfo] = []
@@ -466,7 +470,38 @@ def create_post(post_data: PostCreate, current_user: dict = Depends(get_current_
         "created_at": datetime.utcnow()
     }
     db.posts.insert_one(post_dict)
-    return PostResponse(**post_dict)
+    return _enrich_post(post_dict)
+
+
+def _enrich_post(post: dict) -> PostResponse:
+    """Attach current user avatar (and comment authors' avatars) fetched from users collection."""
+    # Post author avatar
+    user_avatar = None
+    author = db.users.find_one({"id": post.get("user_id")}, {"avatar": 1, "headline": 1, "name": 1})
+    if author:
+        user_avatar = author.get("avatar")
+        # Also refresh headline & name (may have changed)
+        post["user_headline"] = author.get("headline", post.get("user_headline", ""))
+        post["user_name"] = author.get("name", post.get("user_name", ""))
+    post["user_avatar"] = user_avatar
+
+    # Enrich comments with authors' avatars
+    comments = post.get("comments", []) or []
+    if comments:
+        author_ids = list({c.get("user_id") for c in comments if c.get("user_id")})
+        if author_ids:
+            authors_docs = list(db.users.find(
+                {"id": {"$in": author_ids}},
+                {"id": 1, "avatar": 1, "name": 1, "_id": 0}
+            ))
+            author_map = {a["id"]: a for a in authors_docs}
+            for c in comments:
+                a = author_map.get(c.get("user_id")) or {}
+                c["user_avatar"] = a.get("avatar")
+                if a.get("name"):
+                    c["user_name"] = a["name"]
+    return PostResponse(**post)
+
 
 @api_router.get("/posts", response_model=List[PostResponse])
 def get_posts(current_user: dict = Depends(get_current_user)):
@@ -489,17 +524,17 @@ def get_posts(current_user: dict = Depends(get_current_user)):
     connection_ids.add(current_user["id"])
     
     posts = list(db.posts.find({"user_id": {"$in": list(connection_ids)}}).sort("created_at", -1).limit(100))
-    return [PostResponse(**post) for post in posts]
+    return [_enrich_post(post) for post in posts]
 
 @api_router.get("/posts/all", response_model=List[PostResponse])
 def get_all_posts(current_user: dict = Depends(get_current_user)):
     posts = list(db.posts.find().sort("created_at", -1).limit(100))
-    return [PostResponse(**post) for post in posts]
+    return [_enrich_post(post) for post in posts]
 
 @api_router.get("/posts/user/{user_id}", response_model=List[PostResponse])
 def get_user_posts(user_id: str, current_user: dict = Depends(get_current_user)):
     posts = list(db.posts.find({"user_id": user_id}).sort("created_at", -1).limit(100))
-    return [PostResponse(**post) for post in posts]
+    return [_enrich_post(post) for post in posts]
 
 @api_router.post("/posts/{post_id}/like")
 def like_post(post_id: str, current_user: dict = Depends(get_current_user)):
@@ -532,7 +567,7 @@ def add_comment(post_id: str, comment_data: CommentCreate, current_user: dict = 
     
     db.posts.update_one({"id": post_id}, {"$push": {"comments": comment}})
     updated_post = db.posts.find_one({"id": post_id})
-    return PostResponse(**updated_post)
+    return _enrich_post(updated_post)
 
 @api_router.delete("/posts/{post_id}")
 def delete_post(post_id: str, current_user: dict = Depends(get_current_user)):
@@ -775,6 +810,7 @@ def _serialize_group(group: dict, current_user_id: str) -> GroupResponse:
     return GroupResponse(
         id=group["id"],
         name=group["name"],
+        avatar=group.get("avatar"),
         owner_id=group["owner_id"],
         owner_name=owner_name,
         members=members,
@@ -816,6 +852,7 @@ def create_group(payload: GroupCreate, current_user: dict = Depends(get_current_
     group_doc = {
         "id": group_id,
         "name": name,
+        "avatar": payload.avatar,
         "owner_id": current_user["id"],
         "member_ids": all_members,
         "read_state": {current_user["id"]: now},
@@ -859,6 +896,8 @@ def update_group(group_id: str, payload: GroupUpdate, current_user: dict = Depen
         if len(name) > 60:
             raise HTTPException(status_code=400, detail="Group name too long")
         updates["name"] = name
+    if payload.avatar is not None:
+        updates["avatar"] = payload.avatar or None
     if updates:
         db.groups.update_one({"id": group_id}, {"$set": updates})
         group.update(updates)
