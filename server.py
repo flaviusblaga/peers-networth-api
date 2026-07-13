@@ -91,6 +91,10 @@ class PostCreate(BaseModel):
     image: Optional[str] = None  # base64
     link: Optional[str] = None
 
+class PostUpdate(BaseModel):
+    content: Optional[str] = None
+    link: Optional[str] = None
+
 class PostResponse(BaseModel):
     id: str
     user_id: str
@@ -141,7 +145,6 @@ class ConversationResponse(BaseModel):
     user_id: str
     user_name: str
     user_headline: Optional[str] = ""
-    user_avatar: Optional[str] = None
     last_message: str
     last_message_time: datetime
     unread_count: int = 0
@@ -572,6 +575,25 @@ def add_comment(post_id: str, comment_data: CommentCreate, current_user: dict = 
     updated_post = db.posts.find_one({"id": post_id})
     return _enrich_post(updated_post)
 
+@api_router.put("/posts/{post_id}", response_model=PostResponse)
+def update_post(post_id: str, post_data: PostUpdate, current_user: dict = Depends(get_current_user)):
+    post = db.posts.find_one({"id": post_id})
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    if post["user_id"] != current_user["id"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    update_dict = {}
+    if post_data.content is not None:
+        update_dict["content"] = post_data.content
+    if post_data.link is not None:
+        update_dict["link"] = post_data.link
+    if update_dict:
+        db.posts.update_one({"id": post_id}, {"$set": update_dict})
+
+    updated_post = db.posts.find_one({"id": post_id})
+    return _enrich_post(updated_post)
+
 @api_router.delete("/posts/{post_id}")
 def delete_post(post_id: str, current_user: dict = Depends(get_current_user)):
     post = db.posts.find_one({"id": post_id})
@@ -762,10 +784,9 @@ def get_conversations(current_user: dict = Depends(get_current_user)):
         other_user_name = msg["to_user_name"] if msg["from_user_id"] == current_user["id"] else msg["from_user_name"]
         
         if other_user_id not in conversations:
-            # Get user headline + avatar
+            # Get user headline
             other_user = db.users.find_one({"id": other_user_id})
             headline = other_user.get("headline", "") if other_user else ""
-            avatar = other_user.get("avatar") if other_user else None
             
             # Count unread
             unread = db.messages.count_documents({
@@ -778,7 +799,6 @@ def get_conversations(current_user: dict = Depends(get_current_user)):
                 user_id=other_user_id,
                 user_name=other_user_name,
                 user_headline=headline,
-                user_avatar=avatar,
                 last_message=msg["content"],
                 last_message_time=msg["created_at"],
                 unread_count=unread
