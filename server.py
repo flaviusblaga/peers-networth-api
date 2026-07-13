@@ -148,6 +148,7 @@ class ConversationResponse(BaseModel):
     user_id: str
     user_name: str
     user_headline: Optional[str] = ""
+    user_avatar: Optional[str] = None
     last_message: str
     last_message_time: datetime
     unread_count: int = 0
@@ -811,21 +812,23 @@ def get_conversations(current_user: dict = Depends(get_current_user)):
         other_user_name = msg["to_user_name"] if msg["from_user_id"] == current_user["id"] else msg["from_user_name"]
         
         if other_user_id not in conversations:
-            # Get user headline
+            # Get user headline and avatar
             other_user = db.users.find_one({"id": other_user_id})
             headline = other_user.get("headline", "") if other_user else ""
-            
+            avatar = other_user.get("avatar") if other_user else None
+
             # Count unread
             unread = db.messages.count_documents({
                 "from_user_id": other_user_id,
                 "to_user_id": current_user["id"],
                 "read": False
             })
-            
+
             conversations[other_user_id] = ConversationResponse(
                 user_id=other_user_id,
                 user_name=other_user_name,
                 user_headline=headline,
+                user_avatar=avatar,
                 last_message=msg["content"],
                 last_message_time=msg["created_at"],
                 unread_count=unread
