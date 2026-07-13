@@ -95,6 +95,9 @@ class PostUpdate(BaseModel):
     content: Optional[str] = None
     link: Optional[str] = None
 
+class CommentUpdate(BaseModel):
+    content: str
+
 class PostResponse(BaseModel):
     id: str
     user_id: str
@@ -572,6 +575,30 @@ def add_comment(post_id: str, comment_data: CommentCreate, current_user: dict = 
     }
     
     db.posts.update_one({"id": post_id}, {"$push": {"comments": comment}})
+    updated_post = db.posts.find_one({"id": post_id})
+    return _enrich_post(updated_post)
+
+@api_router.put("/posts/{post_id}/comments/{comment_id}", response_model=PostResponse)
+def update_comment(post_id: str, comment_id: str, comment_data: CommentUpdate, current_user: dict = Depends(get_current_user)):
+    post = db.posts.find_one({"id": post_id})
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+
+    comment = next((c for c in post.get("comments", []) if c.get("id") == comment_id), None)
+    if not comment:
+        raise HTTPException(status_code=404, detail="Comment not found")
+    if comment.get("user_id") != current_user["id"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    content = comment_data.content.strip()
+    if not content:
+        raise HTTPException(status_code=400, detail="Comment content is required")
+
+    db.posts.update_one(
+        {"id": post_id, "comments.id": comment_id},
+        {"$set": {"comments.$.content": content}}
+    )
+
     updated_post = db.posts.find_one({"id": post_id})
     return _enrich_post(updated_post)
 
