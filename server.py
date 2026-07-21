@@ -16,6 +16,7 @@ from datetime import datetime, timedelta
 from passlib.context import CryptContext
 from jose import JWTError, jwt
 import base64
+import secrets
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -58,6 +59,7 @@ class UserBase(BaseModel):
 
 class UserCreate(UserBase):
     password: str
+    invite_code: Optional[str] = None
 
 class UserLogin(BaseModel):
     email: EmailStr
@@ -287,6 +289,27 @@ def register(user_data: UserCreate):
     existing = db.users.find_one({"email": user_data.email})
     if existing:
         raise HTTPException(status_code=400, detail="Email already registered")
+
+    # Invite code required (admins exempt)
+    used_code = None
+    used_source = ""
+    if user_data.email not in ADMIN_EMAILS:
+        code = (user_data.invite_code or "").strip().upper()
+        if not code:
+            raise HTTPException(status_code=403, detail="Invite code required")
+        inv = db.invite_codes.find_one({"code": code, "active": True})
+        if not inv:
+            raise HTTPException(status_code=403, detail="Invalid invite code")
+        if inv.get("max_uses") and inv.get("used_count", 0) >= inv["max_uses"]:
+            raise HTTPException(status_code=403, detail="Invite code already used up")
+        db.invite_codes.update_one(
+            {"code": code},
+            {"$inc": {"used_count": 1}, "$push": {"used_by": user_data.email}}
+        )
+        used_code = code
+        used_source = inv.get("note", "")
+    else:
+        used_source = "admin"
     
     # Create user
     user_id = str(uuid.uuid4())
@@ -304,9 +327,11 @@ def register(user_data: UserCreate):
         "language": user_data.language or "en",
         "is_admin": is_admin,
         "is_blocked": False,
+        "invite_code": used_code,
+        "invite_source": used_source,
         "created_at": datetime.utcnow()
     }
-    
+
     db.users.insert_one(user_dict)
     
     # Create token
@@ -1201,6 +1226,95 @@ def delete_user_admin(user_id: str, admin_user: dict = Depends(get_admin_user)):
     db.messages.delete_many({"$or": [{"from_user_id": user_id}, {"to_user_id": user_id}]})
     
     return {"message": "User deleted successfully"}
+
+class InviteCreate(BaseModel):
+    max_uses: Optional[int] = None
+    note: Optional[str] = ""
+
+@api_router.post("/admin/invites")
+def create_invite(payload: InviteCreate, admin_user: dict = Depends(get_admin_user)):
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    code = "".join(secrets.choice(alphabet) for _ in range(8))
+    doc = {
+        "code": code,
+        "active": True,
+        "max_uses": payload.max_uses,
+        "used_count": 0,
+        "used_by": [],
+        "note": payload.note or "",
+        "created_by": admin_user["email"],
+        "created_at": datetime.utcnow()
+    }
+    db.invite_codes.insert_one(doc)
+    doc.pop("_id", None)
+    return doc
+
+@api_router.get("/admin/invites")
+def list_invites(admin_user: dict = Depends(get_admin_user)):
+    return list(db.invite_codes.find({}, {"_id": 0}).sort("created_at", -1).limit(200))
+
+@api_router.delete("/admin/invites/{code}")
+def deactivate_invite(code: str, admin_user: dict = Depends(get_admin_user)):
+    result = db.invite_codes.update_one({"code": code.upper()}, {"$set": {"active": False}})
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Invite code not found")
+    return {"message": "Invite code deactivated"}
+
+@api_router.get("/admin/members/export")
+def export_members(admin_user: dict = Depends(get_admin_user)):
+    from fastapi.responses import StreamingResponse
+    from openpyxl import Workbook
+    from openpyxl.styles import Font
+    import io
+
+    # Fallback map for members registered before invite tracking: email -> (code, note)
+    code_map = {}
+    for inv in db.invite_codes.find({}, {"_id": 0, "code": 1, "note": 1, "used_by": 1}):
+        for em in inv.get("used_by", []):
+            code_map.setdefault(em, (inv["code"], inv.get("note", "")))
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Members"
+    headers = ["Name", "Email", "Headline", "Location", "Language",
+               "Registered at", "Invite code", "Source", "Admin", "Blocked"]
+    ws.append(headers)
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+
+    for u in db.users.find().sort("created_at", 1):
+        code = u.get("invite_code") or ""
+        source = u.get("invite_source") or ""
+        if not code and u.get("email") in code_map:
+            code, mapped_note = code_map[u["email"]]
+            source = source or mapped_note
+        created = u.get("created_at")
+        ws.append([
+            u.get("name", ""),
+            u.get("email", ""),
+            u.get("headline", ""),
+            u.get("location", ""),
+            u.get("language", ""),
+            created.strftime("%Y-%m-%d %H:%M") if created else "",
+            code,
+            source,
+            "yes" if u.get("is_admin") else "",
+            "yes" if u.get("is_blocked") else "",
+        ])
+
+    widths = [22, 30, 26, 18, 10, 17, 13, 22, 8, 8]
+    for i, w in enumerate(widths, start=1):
+        ws.column_dimensions[ws.cell(row=1, column=i).column_letter].width = w
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    filename = "peers-members-" + datetime.utcnow().strftime("%Y-%m-%d") + ".xlsx"
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
+    )
 
 @api_router.get("/admin/posts")
 def get_all_posts_admin(admin_user: dict = Depends(get_admin_user)):
