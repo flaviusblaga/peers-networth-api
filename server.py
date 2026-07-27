@@ -56,6 +56,8 @@ class UserBase(BaseModel):
     experience: List[dict] = []
     language: str = "en"  # "en" or "ro"
     avatar: Optional[str] = None  # base64 image
+    can_help_with: List[str] = []
+    wins: List[dict] = []  # {id, title, problem, action, result}
 
 class UserCreate(UserBase):
     password: str
@@ -74,6 +76,8 @@ class UserUpdate(BaseModel):
     experience: Optional[List[dict]] = None
     language: Optional[str] = None
     avatar: Optional[str] = None  # base64 image
+    can_help_with: Optional[List[str]] = None
+    wins: Optional[List[dict]] = None
 
 class UserResponse(UserBase):
     id: str
@@ -92,6 +96,7 @@ class PostCreate(BaseModel):
     content: str
     image: Optional[str] = None  # base64
     link: Optional[str] = None
+    anonymous: Optional[bool] = False  # dilemma post - author hidden
 
 class PostUpdate(BaseModel):
     content: Optional[str] = None
@@ -327,6 +332,8 @@ def register(user_data: UserCreate):
         "language": user_data.language or "en",
         "is_admin": is_admin,
         "is_blocked": False,
+        "can_help_with": [],
+        "wins": [],
         "invite_code": used_code,
         "invite_source": used_source,
         "created_at": datetime.utcnow()
@@ -381,6 +388,8 @@ def login(credentials: UserLogin):
             created_at=user["created_at"],
             connections_count=connections_count,
             avatar=user.get("avatar"),
+            can_help_with=user.get("can_help_with", []),
+            wins=user.get("wins", []),
             is_admin=is_admin,
             is_blocked=user.get("is_blocked", False)
         )
@@ -403,6 +412,8 @@ def get_me(current_user: dict = Depends(get_current_user)):
         created_at=current_user["created_at"],
         connections_count=connections_count,
         avatar=current_user.get("avatar"),
+        can_help_with=current_user.get("can_help_with", []),
+        wins=current_user.get("wins", []),
         is_admin=is_admin,
         is_blocked=current_user.get("is_blocked", False)
     )
@@ -430,6 +441,8 @@ def update_me(update_data: UserUpdate, current_user: dict = Depends(get_current_
         created_at=updated_user["created_at"],
         connections_count=connections_count,
         avatar=updated_user.get("avatar"),
+        can_help_with=updated_user.get("can_help_with", []),
+        wins=updated_user.get("wins", []),
         is_admin=is_admin,
         is_blocked=updated_user.get("is_blocked", False)
     )
@@ -443,7 +456,8 @@ def get_users(search: Optional[str] = None, current_user: dict = Depends(get_cur
         query["$or"] = [
             {"name": {"$regex": search, "$options": "i"}},
             {"headline": {"$regex": search, "$options": "i"}},
-            {"skills": {"$elemMatch": {"$regex": search, "$options": "i"}}}
+            {"skills": {"$elemMatch": {"$regex": search, "$options": "i"}}},
+            {"can_help_with": {"$elemMatch": {"$regex": search, "$options": "i"}}}
         ]
     
     users = list(db.users.find(query).limit(100))
@@ -486,7 +500,9 @@ def get_user(user_id: str, current_user: dict = Depends(get_current_user)):
         language=user.get("language", "en"),
         created_at=user["created_at"],
         connections_count=connections_count,
-        avatar=user.get("avatar")
+        avatar=user.get("avatar"),
+        can_help_with=user.get("can_help_with", []),
+        wins=user.get("wins", [])
     )
 
 # ==================== POST ROUTES ====================
@@ -502,6 +518,7 @@ def create_post(post_data: PostCreate, current_user: dict = Depends(get_current_
         "content": post_data.content,
         "image": post_data.image,
         "link": post_data.link,
+        "anonymous": bool(post_data.anonymous),
         "likes": [],
         "comments": [],
         "created_at": datetime.utcnow()
@@ -512,15 +529,21 @@ def create_post(post_data: PostCreate, current_user: dict = Depends(get_current_
 
 def _enrich_post(post: dict) -> PostResponse:
     """Attach current user avatar (and comment authors' avatars) fetched from users collection."""
-    # Post author avatar
-    user_avatar = None
-    author = db.users.find_one({"id": post.get("user_id")}, {"avatar": 1, "headline": 1, "name": 1})
-    if author:
-        user_avatar = author.get("avatar")
-        # Also refresh headline & name (may have changed)
-        post["user_headline"] = author.get("headline", post.get("user_headline", ""))
-        post["user_name"] = author.get("name", post.get("user_name", ""))
-    post["user_avatar"] = user_avatar
+    if post.get("anonymous"):
+        # Dilemma post: mask the author entirely
+        post["user_id"] = ""
+        post["user_name"] = "🎭 Anonymous member"
+        post["user_headline"] = "Dilemma / Dilemă"
+        post["user_avatar"] = None
+    else:
+        user_avatar = None
+        author = db.users.find_one({"id": post.get("user_id")}, {"avatar": 1, "headline": 1, "name": 1})
+        if author:
+            user_avatar = author.get("avatar")
+            # Also refresh headline & name (may have changed)
+            post["user_headline"] = author.get("headline", post.get("user_headline", ""))
+            post["user_name"] = author.get("name", post.get("user_name", ""))
+        post["user_avatar"] = user_avatar
 
     # Enrich comments with authors' avatars
     comments = post.get("comments", []) or []
@@ -560,7 +583,12 @@ def get_posts(current_user: dict = Depends(get_current_user)):
     # Include own posts and connections' posts
     connection_ids.add(current_user["id"])
     
-    posts = list(db.posts.find({"user_id": {"$in": list(connection_ids)}}).sort("created_at", -1).limit(100))
+    posts = list(db.posts.find({
+        "$or": [
+            {"user_id": {"$in": list(connection_ids)}},
+            {"anonymous": True}
+        ]
+    }).sort("created_at", -1).limit(100))
     return [_enrich_post(post) for post in posts]
 
 @api_router.get("/posts/all", response_model=List[PostResponse])
@@ -1139,6 +1167,146 @@ def send_group_message(group_id: str, payload: GroupMessageCreate, current_user:
     return GroupMessageResponse(**msg)
 
 
+# ==================== PEER CIRCLES ====================
+
+class CircleCreate(BaseModel):
+    name: str
+    topic: Optional[str] = ""
+    city: Optional[str] = ""
+    max_members: Optional[int] = 8
+
+@api_router.get("/circles")
+def list_circles(current_user: dict = Depends(get_current_user)):
+    circles = list(db.groups.find({"is_circle": True}).sort("created_at", -1).limit(100))
+    result = []
+    for c in circles:
+        member_ids = c.get("member_ids", [])
+        owner = db.users.find_one({"id": c["owner_id"]}, {"name": 1})
+        result.append({
+            "id": c["id"],
+            "name": c["name"],
+            "topic": c.get("topic", ""),
+            "city": c.get("city", ""),
+            "member_count": len(member_ids),
+            "max_members": c.get("max_members", 8),
+            "is_member": current_user["id"] in member_ids,
+            "owner_name": owner.get("name", "") if owner else "",
+        })
+    return result
+
+@api_router.post("/circles")
+def create_circle(payload: CircleCreate, current_user: dict = Depends(get_current_user)):
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Circle name is required")
+    if len(name) > 60:
+        raise HTTPException(status_code=400, detail="Circle name too long")
+    max_members = payload.max_members or 8
+    if max_members < 2 or max_members > 20:
+        raise HTTPException(status_code=400, detail="Max members must be between 2 and 20")
+    now = datetime.utcnow()
+    doc = {
+        "id": str(uuid.uuid4()),
+        "name": name,
+        "avatar": None,
+        "owner_id": current_user["id"],
+        "member_ids": [current_user["id"]],
+        "read_state": {current_user["id"]: now},
+        "is_circle": True,
+        "topic": (payload.topic or "").strip(),
+        "city": (payload.city or "").strip(),
+        "max_members": max_members,
+        "created_at": now,
+    }
+    db.groups.insert_one(doc)
+    doc.pop("_id", None)
+    doc.pop("read_state", None)
+    return doc
+
+@api_router.post("/circles/{circle_id}/join")
+def join_circle(circle_id: str, current_user: dict = Depends(get_current_user)):
+    c = db.groups.find_one({"id": circle_id, "is_circle": True})
+    if not c:
+        raise HTTPException(status_code=404, detail="Circle not found")
+    member_ids = c.get("member_ids", [])
+    if current_user["id"] in member_ids:
+        return {"message": "Already a member"}
+    if len(member_ids) >= c.get("max_members", 8):
+        raise HTTPException(status_code=400, detail="Circle is full")
+    db.groups.update_one(
+        {"id": circle_id},
+        {"$addToSet": {"member_ids": current_user["id"]},
+         "$set": {f"read_state.{current_user['id']}": datetime.utcnow()}}
+    )
+    return {"message": "Joined circle"}
+
+# ==================== EVENTS / ROUNDTABLES ====================
+
+class EventCreate(BaseModel):
+    title: str
+    city: Optional[str] = ""
+    date: Optional[str] = ""  # "YYYY-MM-DD HH:MM"
+    description: Optional[str] = ""
+    max_seats: Optional[int] = None
+
+@api_router.get("/events")
+def list_events(current_user: dict = Depends(get_current_user)):
+    events = list(db.events.find({}, {"_id": 0}).sort("date", 1).limit(100))
+    result = []
+    for ev in events:
+        rsvps = ev.get("rsvps", [])
+        names = []
+        if rsvps:
+            docs = db.users.find({"id": {"$in": rsvps}}, {"name": 1, "_id": 0}).limit(50)
+            names = [d.get("name", "") for d in docs]
+        ev["rsvp_count"] = len(rsvps)
+        ev["attendee_names"] = names
+        ev["me"] = current_user["id"] in rsvps
+        ev.pop("rsvps", None)
+        result.append(ev)
+    return result
+
+@api_router.post("/admin/events")
+def create_event(payload: EventCreate, admin_user: dict = Depends(get_admin_user)):
+    title = payload.title.strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="Event title is required")
+    doc = {
+        "id": str(uuid.uuid4()),
+        "title": title,
+        "city": (payload.city or "").strip(),
+        "date": (payload.date or "").strip(),
+        "description": (payload.description or "").strip(),
+        "max_seats": payload.max_seats,
+        "rsvps": [],
+        "created_by": admin_user["email"],
+        "created_at": datetime.utcnow(),
+    }
+    db.events.insert_one(doc)
+    doc.pop("_id", None)
+    return doc
+
+@api_router.delete("/admin/events/{event_id}")
+def delete_event(event_id: str, admin_user: dict = Depends(get_admin_user)):
+    result = db.events.delete_one({"id": event_id})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Event not found")
+    return {"message": "Event deleted"}
+
+@api_router.post("/events/{event_id}/rsvp")
+def rsvp_event(event_id: str, current_user: dict = Depends(get_current_user)):
+    ev = db.events.find_one({"id": event_id})
+    if not ev:
+        raise HTTPException(status_code=404, detail="Event not found")
+    rsvps = ev.get("rsvps", [])
+    if current_user["id"] in rsvps:
+        db.events.update_one({"id": event_id}, {"$pull": {"rsvps": current_user["id"]}})
+        return {"message": "RSVP removed", "going": False}
+    if ev.get("max_seats") and len(rsvps) >= ev["max_seats"]:
+        raise HTTPException(status_code=400, detail="Event is full")
+    db.events.update_one({"id": event_id}, {"$addToSet": {"rsvps": current_user["id"]}})
+    return {"message": "RSVP confirmed", "going": True}
+
 # ==================== HEALTH CHECK ====================
 
 @api_router.get("/health")
@@ -1191,6 +1359,8 @@ def get_all_users_admin(admin_user: dict = Depends(get_admin_user)):
             created_at=user["created_at"],
             connections_count=connections_count,
             avatar=user.get("avatar"),
+            can_help_with=user.get("can_help_with", []),
+            wins=user.get("wins", []),
             is_admin=is_admin,
             is_blocked=user.get("is_blocked", False)
         ))
