@@ -8,11 +8,14 @@ from pymongo.cursor import Cursor
 Cursor.to_list = lambda self, n: list(self.limit(n))
 import os
 import logging
+import time
+from collections import defaultdict
 from pathlib import Path
 from pydantic import BaseModel, Field, EmailStr
 from typing import List, Optional
 import uuid
 from datetime import datetime, timedelta
+from fastapi import Request
 from passlib.context import CryptContext
 from jose import JWTError, jwt
 import base64
@@ -25,6 +28,79 @@ load_dotenv(ROOT_DIR / '.env')
 mongo_url = os.environ['MONGO_URL']
 client = MongoClient(mongo_url, connect=False, serverSelectionTimeoutMS=15000)
 db = client[os.environ.get('DB_NAME', 'networth_db')]
+
+# ==================== INDEXES ====================
+# Idempotent: create_index is a no-op if the index already exists.
+# Kept in try/except so a transient DB issue at boot can't take the API down.
+def ensure_indexes():
+    try:
+        # users: unique email + unique id (registration relies on both)
+        db.users.create_index([("email", 1)], unique=True)
+        db.users.create_index([("id", 1)], unique=True)
+        db.users.create_index([("name", 1)])
+        db.users.create_index([("created_at", -1)])
+        # posts: feed queries by user_id and created_at
+        db.posts.create_index([("id", 1)], unique=True)
+        db.posts.create_index([("user_id", 1)])
+        db.posts.create_index([("created_at", -1)])
+        db.posts.create_index([("anonymous", 1)])
+        # connections: $or across from_user_id / to_user_id with status
+        db.connections.create_index([("id", 1)], unique=True)
+        db.connections.create_index([("from_user_id", 1), ("status", 1)])
+        db.connections.create_index([("to_user_id", 1), ("status", 1)])
+        # messages: conversation lookups + unread counting
+        db.messages.create_index([("id", 1)], unique=True)
+        db.messages.create_index([("from_user_id", 1), ("to_user_id", 1)])
+        db.messages.create_index([("to_user_id", 1), ("from_user_id", 1), ("read", 1)])
+        # groups: membership query + unique id
+        db.groups.create_index([("id", 1)], unique=True)
+        db.groups.create_index([("member_ids", 1)])
+        db.group_messages.create_index([("group_id", 1), ("created_at", 1)])
+        # events: list by date
+        db.events.create_index([("id", 1)], unique=True)
+        db.events.create_index([("date", 1)])
+        # reports / invite codes
+        db.reports.create_index([("id", 1)], unique=True)
+        db.reports.create_index([("status", 1)])
+        db.invite_codes.create_index([("code", 1)], unique=True)
+        logger.info("MongoDB indexes ensured")
+    except Exception as e:
+        logger.warning("Index creation skipped (non-fatal): %s", e)
+
+# ==================== RATE LIMITING ====================
+# In-memory, per-key sliding window. Fine for a single-instance free tier;
+# replace with Redis-based limiting if the app ever scales horizontally.
+
+class RateLimiter:
+    def __init__(self, max_attempts: int = 5, window_seconds: int = 60):
+        self.max_attempts = max_attempts
+        self.window_seconds = window_seconds
+        self._attempts: dict[str, list[float]] = defaultdict(list)
+
+    def allow(self, key: str) -> bool:
+        now = time.time()
+        cutoff = now - self.window_seconds
+        self._attempts[key] = [t for t in self._attempts[key] if t > cutoff]
+        if len(self._attempts[key]) >= self.max_attempts:
+            return False
+        self._attempts[key].append(now)
+        return True
+
+auth_limiter = RateLimiter(max_attempts=5, window_seconds=60)
+
+def _client_ip(request: Request) -> str:
+    """Best-effort client IP. Render sits behind a proxy, so trust X-Forwarded-For."""
+    fwd = request.headers.get("x-forwarded-for")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+# ==================== AVATAR SIZE LIMIT ====================
+MAX_AVATAR_BASE64 = 4 * 1024 * 1024  # 4MB of base64 (~3MB image). Real compression is a Phase 2 fix.
+
+def _validate_avatar(avatar: Optional[str]):
+    if avatar and len(avatar) > MAX_AVATAR_BASE64:
+        raise HTTPException(status_code=400, detail="Avatar image is too large (max ~3MB)")
 
 # JWT Configuration
 SECRET_KEY = os.environ.get('SECRET_KEY')
@@ -289,7 +365,12 @@ def get_connections_count(user_id: str) -> int:
 # ==================== AUTH ROUTES ====================
 
 @api_router.post("/auth/register", response_model=TokenResponse)
-def register(user_data: UserCreate):
+def register(user_data: UserCreate, request: Request):
+    # Rate limit registration by IP to slow down account-creation spam
+    if not auth_limiter.allow(f"register:{_client_ip(request)}"):
+        raise HTTPException(status_code=429, detail="Too many registrations. Try again later.")
+    _validate_avatar(user_data.avatar)
+
     # Check if email exists
     existing = db.users.find_one({"email": user_data.email})
     if existing:
@@ -364,7 +445,10 @@ def register(user_data: UserCreate):
     )
 
 @api_router.post("/auth/login", response_model=TokenResponse)
-def login(credentials: UserLogin):
+def login(credentials: UserLogin, request: Request):
+    # Rate limit per IP to slow down credential brute-forcing
+    if not auth_limiter.allow(f"login:{_client_ip(request)}"):
+        raise HTTPException(status_code=429, detail="Too many login attempts. Try again later.")
     user = db.users.find_one({"email": credentials.email})
     if not user or not verify_password(credentials.password, user["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid email or password")
@@ -420,6 +504,7 @@ def get_me(current_user: dict = Depends(get_current_user)):
 
 @api_router.put("/auth/me", response_model=UserResponse)
 def update_me(update_data: UserUpdate, current_user: dict = Depends(get_current_user)):
+    _validate_avatar(update_data.avatar)
     update_dict = {k: v for k, v in update_data.dict().items() if v is not None}
     if update_dict:
         db.users.update_one({"id": current_user["id"]}, {"$set": update_dict})
@@ -1552,7 +1637,11 @@ app.include_router(api_router)
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
-    allow_origins=["*"],
+    allow_origins=[
+        "https://peers.networth.ro",
+        "https://www.peers.networth.ro",
+        "http://localhost:8081",
+    ],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -1563,6 +1652,9 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# Ensure indexes at startup (idempotent, non-fatal on failure)
+ensure_indexes()
 
 @app.on_event("shutdown")
 def shutdown_db_client():
