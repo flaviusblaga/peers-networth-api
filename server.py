@@ -1562,6 +1562,7 @@ def create_event(payload: EventCreate, admin_user: dict = Depends(get_admin_user
         "max_seats": payload.max_seats,
         "rsvps": [],
         "created_by": admin_user["email"],
+        "created_by_id": admin_user["id"],
         "created_at": datetime.utcnow(),
     }
     db.events.insert_one(doc)
@@ -1587,6 +1588,26 @@ def rsvp_event(event_id: str, current_user: dict = Depends(get_current_user)):
     if ev.get("max_seats") and len(rsvps) >= ev["max_seats"]:
         raise HTTPException(status_code=400, detail="Event is full")
     db.events.update_one({"id": event_id}, {"$addToSet": {"rsvps": current_user["id"]}})
+
+    # Notify the event creator that someone registered
+    creator_id = ev.get("created_by_id")
+    if not creator_id and ev.get("created_by"):
+        creator_lookup = db.users.find_one({"email": ev["created_by"]}, {"id": 1})
+        creator_id = creator_lookup["id"] if creator_lookup else None
+    if creator_id and creator_id != current_user["id"]:
+        creator = db.users.find_one({"id": creator_id})
+        if creator:
+            db.messages.insert_one({
+                "id": str(uuid.uuid4()),
+                "from_user_id": current_user["id"],
+                "from_user_name": current_user.get("name", ""),
+                "to_user_id": creator_id,
+                "to_user_name": creator.get("name", ""),
+                "content": "S-a inscris la evenimentul tau: " + ev.get("title", ""),
+                "read": False,
+                "created_at": datetime.utcnow()
+            })
+
     return {"message": "RSVP confirmed", "going": True}
 
 # ==================== HEALTH CHECK ====================
