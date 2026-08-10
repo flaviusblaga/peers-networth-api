@@ -1834,6 +1834,9 @@ def get_all_posts_admin(admin_user: dict = Depends(get_admin_user)):
         for u in db.users.find({"id": {"$in": list(user_ids)}}, {"id": 1, "name": 1, "email": 1, "_id": 0}):
             authors[u["id"]] = u
     for p in posts:
+        p.pop("_id", None)  # ObjectId not JSON-serializable -> would 500
+        for c in (p.get("comments") or []):
+            c.pop("_id", None)
         a = authors.get(p.get("user_id"))
         p["author_name"] = a.get("name", "") if a else None
         p["author_email"] = a.get("email", "") if a else None
