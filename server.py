@@ -405,6 +405,7 @@ class AdminStats(BaseModel):
 class AdminUserUpdate(BaseModel):
     is_admin: Optional[bool] = None
     is_blocked: Optional[bool] = None
+    new_password: Optional[str] = None  # admin forced password reset
 
 # ==================== HELPERS ====================
 
@@ -1707,10 +1708,16 @@ def update_user_admin(user_id: str, update_data: AdminUserUpdate, admin_user: di
         update_dict["is_admin"] = update_data.is_admin
     if update_data.is_blocked is not None:
         update_dict["is_blocked"] = update_data.is_blocked
-    
+    if update_data.new_password:
+        # Admin forced reset: hash new password, invalidate any pending email reset code
+        update_dict["password_hash"] = get_password_hash(update_data.new_password)
+        update_dict["password_reset_by"] = admin_user.get("email", "admin")
+        update_dict["password_reset_at"] = datetime.utcnow()
+        db.password_resets.delete_one({"user_id": user_id})
+
     if update_dict:
         db.users.update_one({"id": user_id}, {"$set": update_dict})
-    
+
     return {"message": "User updated successfully"}
 
 @api_router.delete("/admin/users/{user_id}")
@@ -1819,6 +1826,19 @@ def export_members(admin_user: dict = Depends(get_admin_user)):
 @api_router.get("/admin/posts")
 def get_all_posts_admin(admin_user: dict = Depends(get_admin_user)):
     posts = list(db.posts.find().sort("created_at", -1).limit(500))
+    # Resolve real author name/email for every post (including anonymous "dilema" posts,
+    # whose author is masked in the public feed). Admin needs to see the truth.
+    user_ids = {p.get("user_id") for p in posts if p.get("user_id")}
+    authors = {}
+    if user_ids:
+        for u in db.users.find({"id": {"$in": list(user_ids)}}, {"id": 1, "name": 1, "email": 1, "_id": 0}):
+            authors[u["id"]] = u
+    for p in posts:
+        a = authors.get(p.get("user_id"))
+        p["author_name"] = a.get("name", "") if a else None
+        p["author_email"] = a.get("email", "") if a else None
+        if p.get("anonymous"):
+            p["masked_as"] = "🎭 Anonymous member"  # visible only in admin view
     return posts
 
 @api_router.delete("/admin/posts/{post_id}")
