@@ -125,14 +125,20 @@ def _send_email(to: str, subject: str, html: str) -> bool:
         req = urllib.request.Request(
             "https://api.resend.com/emails",
             data=data,
-            headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"},
+            headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json", "User-Agent": "peers-networth/1.0"},
             method="POST",
         )
         urllib.request.urlopen(req, timeout=10)
         logger.info("Email sent to %s: %s", to, subject)
         return True
     except Exception as e:
-        logger.warning("Email send failed to %s: %s", to, e)
+        body = ""
+        try:
+            if hasattr(e, "read"):
+                body = e.read().decode(errors="replace")
+        except Exception:
+            pass
+        logger.warning("Email send failed to %s: %s %s", to, e, body)
         return False
 
 def _notify_connection_request(recipient_id: str, sender_name: str, sender_headline: str):
