@@ -278,6 +278,7 @@ class PostResponse(BaseModel):
     comments: List[dict] = []
     created_at: datetime
     bookmarked: Optional[bool] = False  # set when a user's bookmarks are returned
+    reported: Optional[bool] = False  # set when the current user has reported this post
 
 class BookmarkResponse(BaseModel):
     id: str
@@ -384,9 +385,11 @@ class ReportResponse(BaseModel):
     id: str
     reporter_id: str
     reporter_name: str
+    reporter_email: Optional[str] = None
     reported_user_id: Optional[str] = None
     reported_user_name: Optional[str] = None
     reported_post_id: Optional[str] = None
+    reported_post_content: Optional[str] = None
     reason: str
     description: str
     status: str  # pending, resolved, dismissed
@@ -830,24 +833,30 @@ def get_posts(current_user: dict = Depends(get_current_user)):
         ]
     }).sort("created_at", -1).limit(100))
     _bm = set(b["post_id"] for b in db.bookmarks.find({"user_id": current_user["id"]}, {"post_id": 1, "_id": 0}))
+    _rp = set(r.get("reported_post_id") for r in db.reports.find({"reporter_id": current_user["id"]}, {"reported_post_id": 1, "_id": 0}) if r.get("reported_post_id"))
     for _p in posts:
         _p["bookmarked"] = _p.get("id") in _bm
+        _p["reported"] = _p.get("id") in _rp
     return [_enrich_post(post) for post in posts]
 
 @api_router.get("/posts/all", response_model=List[PostResponse])
 def get_all_posts(current_user: dict = Depends(get_current_user)):
     posts = list(db.posts.find().sort("created_at", -1).limit(100))
     _bm = set(b["post_id"] for b in db.bookmarks.find({"user_id": current_user["id"]}, {"post_id": 1, "_id": 0}))
+    _rp = set(r.get("reported_post_id") for r in db.reports.find({"reporter_id": current_user["id"]}, {"reported_post_id": 1, "_id": 0}) if r.get("reported_post_id"))
     for _p in posts:
         _p["bookmarked"] = _p.get("id") in _bm
+        _p["reported"] = _p.get("id") in _rp
     return [_enrich_post(post) for post in posts]
 
 @api_router.get("/posts/user/{user_id}", response_model=List[PostResponse])
 def get_user_posts(user_id: str, current_user: dict = Depends(get_current_user)):
     posts = list(db.posts.find({"user_id": user_id}).sort("created_at", -1).limit(100))
     _bm = set(b["post_id"] for b in db.bookmarks.find({"user_id": current_user["id"]}, {"post_id": 1, "_id": 0}))
+    _rp = set(r.get("reported_post_id") for r in db.reports.find({"reporter_id": current_user["id"]}, {"reported_post_id": 1, "_id": 0}) if r.get("reported_post_id"))
     for _p in posts:
         _p["bookmarked"] = _p.get("id") in _bm
+        _p["reported"] = _p.get("id") in _rp
     return [_enrich_post(post) for post in posts]
 
 @api_router.post("/posts/{post_id}/like")
@@ -1891,14 +1900,21 @@ def create_report(report_data: ReportCreate, current_user: dict = Depends(get_cu
     if report_data.reported_user_id:
         reported_user = db.users.find_one({"id": report_data.reported_user_id})
         reported_user_name = reported_user["name"] if reported_user else None
-    
+
+    reported_post_content = None
+    if report_data.reported_post_id:
+        rp = db.posts.find_one({"id": report_data.reported_post_id}, {"content": 1, "_id": 0})
+        reported_post_content = (rp.get("content") if rp else None)
+
     report_dict = {
         "id": report_id,
         "reporter_id": current_user["id"],
         "reporter_name": current_user["name"],
+        "reporter_email": current_user.get("email"),
         "reported_user_id": report_data.reported_user_id,
         "reported_user_name": reported_user_name,
         "reported_post_id": report_data.reported_post_id,
+        "reported_post_content": reported_post_content,
         "reason": report_data.reason,
         "description": report_data.description or "",
         "status": "pending",
