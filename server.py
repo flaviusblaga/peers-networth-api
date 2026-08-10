@@ -829,16 +829,25 @@ def get_posts(current_user: dict = Depends(get_current_user)):
             {"anonymous": True}
         ]
     }).sort("created_at", -1).limit(100))
+    _bm = set(b["post_id"] for b in db.bookmarks.find({"user_id": current_user["id"]}, {"post_id": 1, "_id": 0}))
+    for _p in posts:
+        _p["bookmarked"] = _p.get("id") in _bm
     return [_enrich_post(post) for post in posts]
 
 @api_router.get("/posts/all", response_model=List[PostResponse])
 def get_all_posts(current_user: dict = Depends(get_current_user)):
     posts = list(db.posts.find().sort("created_at", -1).limit(100))
+    _bm = set(b["post_id"] for b in db.bookmarks.find({"user_id": current_user["id"]}, {"post_id": 1, "_id": 0}))
+    for _p in posts:
+        _p["bookmarked"] = _p.get("id") in _bm
     return [_enrich_post(post) for post in posts]
 
 @api_router.get("/posts/user/{user_id}", response_model=List[PostResponse])
 def get_user_posts(user_id: str, current_user: dict = Depends(get_current_user)):
     posts = list(db.posts.find({"user_id": user_id}).sort("created_at", -1).limit(100))
+    _bm = set(b["post_id"] for b in db.bookmarks.find({"user_id": current_user["id"]}, {"post_id": 1, "_id": 0}))
+    for _p in posts:
+        _p["bookmarked"] = _p.get("id") in _bm
     return [_enrich_post(post) for post in posts]
 
 @api_router.post("/posts/{post_id}/like")
