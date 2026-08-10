@@ -20,6 +20,14 @@ from passlib.context import CryptContext
 from jose import JWTError, jwt
 import base64
 import secrets
+import urllib.request
+import urllib.error
+import json as _json
+import html
+
+def esc(s):
+    """HTML-escape a value for safe interpolation into email/HTML templates."""
+    return html.escape(s or '', quote=True)
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -63,6 +71,11 @@ def ensure_indexes():
         db.reports.create_index([("id", 1)], unique=True)
         db.reports.create_index([("status", 1)])
         db.invite_codes.create_index([("code", 1)], unique=True)
+        # bookmarks: unique user+post, list by user
+        db.bookmarks.create_index([("user_id", 1), ("post_id", 1)], unique=True)
+        db.bookmarks.create_index([("user_id", 1), ("created_at", -1)])
+        # password resets: one record per user, lookup by user
+        db.password_resets.create_index([("user_id", 1)], unique=True)
         logger.info("MongoDB indexes ensured")
     except Exception as e:
         logger.warning("Index creation skipped (non-fatal): %s", e)
@@ -97,6 +110,65 @@ def _client_ip(request: Request) -> str:
 
 # ==================== AVATAR SIZE LIMIT ====================
 MAX_AVATAR_BASE64 = 4 * 1024 * 1024  # 4MB of base64 (~3MB image). Real compression is a Phase 2 fix.
+
+# ==================== EMAIL (RESEND) ====================
+RESEND_API_KEY = os.environ.get('RESEND_API_KEY', '')
+FROM_EMAIL = os.environ.get('FROM_EMAIL', 'Peers <onboarding@resend.dev>')
+APP_URL = 'https://peers.networth.ro'
+
+def _send_email(to: str, subject: str, html: str) -> bool:
+    """Send email via Resend API. Silently skips if RESEND_API_KEY is not set."""
+    if not RESEND_API_KEY or not to:
+        return False
+    try:
+        data = _json.dumps({"from": FROM_EMAIL, "to": [to], "subject": subject, "html": html}).encode()
+        req = urllib.request.Request(
+            "https://api.resend.com/emails",
+            data=data,
+            headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"},
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=10)
+        logger.info("Email sent to %s: %s", to, subject)
+        return True
+    except Exception as e:
+        logger.warning("Email send failed to %s: %s", to, e)
+        return False
+
+def _notify_connection_request(recipient_id: str, sender_name: str, sender_headline: str):
+    """Send email notification for a new connection request (fire-and-forget)."""
+    user = db.users.find_one({"id": recipient_id})
+    if not user or not user.get("email"):
+        return
+    name = user.get("name", "").split()[0] or "there"
+    _send_email(
+        user["email"],
+        f"{sender_name} wants to connect on Peers",
+        f"""<div style="font-family:-apple-system,sans-serif;max-width:480px;margin:0 auto;padding:20px">
+        <h2 style="color:#00BCD4">🤝 New connection request</h2>
+        <p>Hi {name},</p>
+        <p><b>{esc(sender_name)}</b> ({esc(sender_headline) or 'Peers member'}) wants to connect with you.</p>
+        <p style="margin:20px 0"><a href="{APP_URL}/network" style="background:#00BCD4;color:#0D0D0D;padding:12px 24px;border-radius:12px;text-decoration:none;font-weight:700">View request</a></p>
+        <p style="color:#888;font-size:12px">— Peers by NetWorth</p></div>"""
+    )
+
+def _notify_new_message(recipient_id: str, sender_name: str, preview: str):
+    """Send email notification for a new message (fire-and-forget)."""
+    user = db.users.find_one({"id": recipient_id})
+    if not user or not user.get("email"):
+        return
+    name = user.get("name", "").split()[0] or "there"
+    _send_email(
+        user["email"],
+        f"New message from {sender_name} on Peers",
+        f"""<div style="font-family:-apple-system,sans-serif;max-width:480px;margin:0 auto;padding:20px">
+        <h2 style="color:#00BCD4">💬 New message</h2>
+        <p>Hi {name},</p>
+        <p><b>{esc(sender_name)}</b> sent you a message:</p>
+        <blockquote style="background:#1B1B1B;border-left:3px solid #00BCD4;padding:10px 14px;border-radius:8px;color:#ccc;font-size:14px">{esc(preview[:200])}</blockquote>
+        <p style="margin:20px 0"><a href="{APP_URL}/messages" style="background:#00BCD4;color:#0D0D0D;padding:12px 24px;border-radius:12px;text-decoration:none;font-weight:700">Reply</a></p>
+        <p style="color:#888;font-size:12px">— Peers by NetWorth</p></div>"""
+    )
 
 def _validate_avatar(avatar: Optional[str]):
     if avatar and len(avatar) > MAX_AVATAR_BASE64:
@@ -173,10 +245,14 @@ class PostCreate(BaseModel):
     image: Optional[str] = None  # base64
     link: Optional[str] = None
     anonymous: Optional[bool] = False  # dilemma post - author hidden
+    category: Optional[str] = None  # e.g. "cariera", "investitii", "business", "dilema", "general"
+    tags: Optional[List[str]] = None  # free-form hashtags
 
 class PostUpdate(BaseModel):
     content: Optional[str] = None
     link: Optional[str] = None
+    category: Optional[str] = None
+    tags: Optional[List[str]] = None
 
 class CommentUpdate(BaseModel):
     content: str
@@ -190,8 +266,17 @@ class PostResponse(BaseModel):
     content: str
     image: Optional[str] = None
     link: Optional[str] = None
+    category: Optional[str] = None
+    tags: Optional[List[str]] = []
     likes: List[str] = []
     comments: List[dict] = []
+    created_at: datetime
+    bookmarked: Optional[bool] = False  # set when a user's bookmarks are returned
+
+class BookmarkResponse(BaseModel):
+    id: str
+    user_id: str
+    post_id: str
     created_at: datetime
 
 class CommentCreate(BaseModel):
@@ -479,6 +564,67 @@ def login(credentials: UserLogin, request: Request):
         )
     )
 
+# ==================== PASSWORD RESET (EMAIL CODE) ====================
+PASSWORD_RESET_CODE_TTL_SECONDS = 10 * 60  # 10 minutes
+
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+class ResetPasswordRequest(BaseModel):
+    email: EmailStr
+    code: str
+    new_password: str
+
+@api_router.post("/auth/forgot-password")
+def forgot_password(req: ForgotPasswordRequest):
+    """Send a 6-digit reset code to the user's email (if the account exists)."""
+    user = db.users.find_one({"email": req.email})
+    if user:
+        code = str(secrets.randbelow(1000000)).zfill(6)
+        db.password_resets.update_one(
+            {"user_id": user["id"]},
+            {"$set": {
+                "code": code,
+                "expires_at": datetime.utcnow() + timedelta(seconds=PASSWORD_RESET_CODE_TTL_SECONDS),
+                "used": False,
+                "created_at": datetime.utcnow(),
+            }},
+            upsert=True,
+        )
+        _send_email(
+            user["email"],
+            "Your Peers password reset code",
+            f"""<div style="font-family:-apple-system,sans-serif;max-width:480px;margin:0 auto;padding:20px">
+            <h2 style="color:#00BCD4">🔑 Password reset</h2>
+            <p>Hi {esc(user.get('name', '')).split()[0] or 'there'},</p>
+            <p>Use this code to reset your Peers password. It expires in 10 minutes.</p>
+            <p style="font-size:28px;font-weight:800;letter-spacing:6px;background:#1B1B1B;padding:14px;border-radius:12px;text-align:center">{code}</p>
+            <p style="color:#888;font-size:12px">If you didn't request this, you can safely ignore this email.</p>
+            <p style="color:#888;font-size:12px">— Peers by NetWorth</p></div>"""
+        )
+    # Always return 200 so we don't leak which emails are registered
+    return {"message": "If that email is registered, a reset code has been sent."}
+
+@api_router.post("/auth/reset-password")
+def reset_password(req: ResetPasswordRequest):
+    """Verify the emailed code and set a new password."""
+    user = db.users.find_one({"email": req.email})
+    if not user:
+        raise HTTPException(status_code=404, detail="Account not found")
+    rec = db.password_resets.find_one({"user_id": user["id"]})
+    if not rec or rec.get("used") or rec.get("expires_at") is None:
+        raise HTTPException(status_code=400, detail="No active reset code. Request a new one.")
+    if rec["expires_at"] < datetime.utcnow():
+        raise HTTPException(status_code=400, detail="Code expired. Request a new one.")
+    # Compare safely — constant-ish comparison, accept whitespace stripped
+    supplied = req.code.strip()
+    stored = str(rec.get("code", ""))
+    if not secrets.compare_digest(supplied.encode(), stored.encode()):
+        raise HTTPException(status_code=400, detail="Invalid code")
+    db.users.update_one({"id": user["id"]}, {"$set": {"password_hash": get_password_hash(req.new_password)}})
+    db.password_resets.update_one({"user_id": user["id"]}, {"$set": {"used": True}})
+    return {"message": "Password updated. You can now log in."}
+
 @api_router.get("/auth/me", response_model=UserResponse)
 def get_me(current_user: dict = Depends(get_current_user)):
     connections_count = get_connections_count(current_user["id"])
@@ -604,6 +750,8 @@ def create_post(post_data: PostCreate, current_user: dict = Depends(get_current_
         "image": post_data.image,
         "link": post_data.link,
         "anonymous": bool(post_data.anonymous),
+        "category": post_data.category,
+        "tags": post_data.tags or [],
         "likes": [],
         "comments": [],
         "created_at": datetime.utcnow()
@@ -756,6 +904,10 @@ def update_post(post_id: str, post_data: PostUpdate, current_user: dict = Depend
         update_dict["content"] = post_data.content
     if post_data.link is not None:
         update_dict["link"] = post_data.link
+    if post_data.category is not None:
+        update_dict["category"] = post_data.category
+    if post_data.tags is not None:
+        update_dict["tags"] = post_data.tags
     if update_dict:
         db.posts.update_one({"id": post_id}, {"$set": update_dict})
 
@@ -773,7 +925,35 @@ def delete_post(post_id: str, current_user: dict = Depends(get_current_user)):
     db.posts.delete_one({"id": post_id})
     return {"message": "Post deleted"}
 
-# ==================== CONNECTION ROUTES ====================
+# ==================== BOOKMARK ROUTES ====================
+
+@api_router.post("/posts/{post_id}/bookmark")
+def toggle_bookmark(post_id: str, current_user: dict = Depends(get_current_user)):
+    post = db.posts.find_one({"id": post_id})
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    existing = db.bookmarks.find_one({"user_id": current_user["id"], "post_id": post_id})
+    if existing:
+        db.bookmarks.delete_one({"_id": existing["_id"]})
+        return {"message": "Bookmark removed", "bookmarked": False}
+    db.bookmarks.insert_one({
+        "id": str(uuid.uuid4()),
+        "user_id": current_user["id"],
+        "post_id": post_id,
+        "created_at": datetime.utcnow(),
+    })
+    return {"message": "Post bookmarked", "bookmarked": True}
+
+@api_router.get("/bookmarks", response_model=List[PostResponse])
+def get_bookmarks(current_user: dict = Depends(get_current_user)):
+    bookmarks = list(db.bookmarks.find({"user_id": current_user["id"]}).sort("created_at", -1).limit(200))
+    post_ids = [b["post_id"] for b in bookmarks if b.get("post_id")]
+    posts = list(db.posts.find({"id": {"$in": post_ids}}))
+    posts_by_id = {p["id"]: p for p in posts}
+    ordered = [posts_by_id[pid] for pid in post_ids if pid in posts_by_id]
+    for p in ordered:
+        p["bookmarked"] = True
+    return [_enrich_post(p) for p in ordered]
 
 # ==================== CONNECTION ROUTES ====================
 
@@ -829,6 +1009,11 @@ def create_connection_request(request: ConnectionRequest, current_user: dict = D
     db.connections.insert_one(conn_dict)
     conn_dict["from_user_avatar"] = current_user.get("avatar")
     conn_dict["to_user_avatar"] = to_user.get("avatar")
+    _notify_connection_request(
+        request.to_user_id,
+        current_user.get("name", "A Peers member"),
+        current_user.get("headline", ""),
+    )
     return ConnectionResponse(**conn_dict)
 
 @api_router.get("/connections", response_model=List[ConnectionResponse])
@@ -934,6 +1119,11 @@ def send_message(message_data: MessageCreate, current_user: dict = Depends(get_c
     }
     
     db.messages.insert_one(msg_dict)
+    _notify_new_message(
+        message_data.to_user_id,
+        current_user.get("name", "A Peers member"),
+        message_data.content,
+    )
     return MessageResponse(**msg_dict)
 
 @api_router.get("/messages/conversations", response_model=List[ConversationResponse])
@@ -1423,6 +1613,55 @@ def get_admin_stats(admin_user: dict = Depends(get_admin_user)):
         new_users_today=new_users_today,
         new_posts_today=new_posts_today
     )
+
+@api_router.post("/admin/digest")
+def send_weekly_digest(admin_user: dict = Depends(get_admin_user)):
+    """Send a weekly re-engagement digest email to ALL registered users (admin-triggered)."""
+    week_ago = datetime.utcnow() - timedelta(days=7)
+    sent, skipped = 0, 0
+
+    # Aggregate weekly activity
+    new_users = db.users.count_documents({"created_at": {"$gte": week_ago}})
+    new_posts = db.posts.count_documents({"created_at": {"$gte": week_ago}})
+    new_connections = db.connections.count_documents({"created_at": {"$gte": week_ago}, "status": "accepted"})
+    new_messages = db.messages.count_documents({"created_at": {"$gte": week_ago}})
+
+    active_users = list(db.users.find(
+        {
+            "email": {"$ne": ""},
+            "created_at": {"$lte": week_ago},
+        },
+        {"email": 1, "name": 1, "_id": 0},
+    ).limit(500))
+
+    for u in active_users:
+        email = (u.get("email") or "").strip()
+        if not email:
+            skipped += 1
+            continue
+        name = (u.get("name") or "there").split()[0]
+        ok = _send_email(
+            email,
+            "Your Peers weekly recap",
+            f"""<div style="font-family:-apple-system,sans-serif;max-width:480px;margin:0 auto;padding:20px">
+            <h2 style="color:#00BCD4">📈 Your week on Peers</h2>
+            <p>Hi {esc(name)},</p>
+            <p>Here's what happened in the last 7 days:</p>
+            <table style="width:100%;border-collapse:collapse;margin:16px 0">
+              <tr><td style="padding:8px;border-bottom:1px solid #333">👥 New members</td><td style="padding:8px;border-bottom:1px solid #333;text-align:right;font-weight:700">{new_users}</td></tr>
+              <tr><td style="padding:8px;border-bottom:1px solid #333">💬 New posts & dilemmas</td><td style="padding:8px;border-bottom:1px solid #333;text-align:right;font-weight:700">{new_posts}</td></tr>
+              <tr><td style="padding:8px;border-bottom:1px solid #333">🤝 New connections</td><td style="padding:8px;border-bottom:1px solid #333;text-align:right;font-weight:700">{new_connections}</td></tr>
+              <tr><td style="padding:8px">✉️ New messages</td><td style="padding:8px;text-align:right;font-weight:700">{new_messages}</td></tr>
+            </table>
+            <p>Someone might be waiting for your answer — <a href="{APP_URL}/network" style="color:#00BCD4">see what's new</a>.</p>
+            <p style="color:#888;font-size:12px">— Peers by NetWorth</p></div>"""
+        )
+        if ok:
+            sent += 1
+        else:
+            skipped += 1
+
+    return {"sent": sent, "skipped": skipped}
 
 @api_router.get("/admin/users", response_model=List[UserResponse])
 def get_all_users_admin(admin_user: dict = Depends(get_admin_user)):
