@@ -688,6 +688,72 @@ def update_me(update_data: UserUpdate, current_user: dict = Depends(get_current_
         is_blocked=updated_user.get("is_blocked", False)
     )
 
+# ==================== GDPR: DATA EXPORT & ACCOUNT DELETION ====================
+
+@api_router.get("/auth/me/export")
+def export_my_data(current_user: dict = Depends(get_current_user)):
+    """GDPR data portability: return ALL personal data we hold for the current user as JSON.
+    Password hash and internal Mongo _id are intentionally excluded."""
+    uid = current_user["id"]
+
+    def clean(doc):
+        if isinstance(doc, dict):
+            doc.pop("_id", None)
+            doc.pop("password_hash", None)
+        return doc
+
+    profile = clean(dict(current_user))
+
+    posts = [clean(p) for p in db.posts.find({"user_id": uid})]
+    bookmarks = [clean(b) for b in db.bookmarks.find({"user_id": uid})]
+    connections = [clean(c) for c in db.connections.find(
+        {"$or": [{"from_user_id": uid}, {"to_user_id": uid}]})]
+    messages = [clean(m) for m in db.messages.find(
+        {"$or": [{"from_user_id": uid}, {"to_user_id": uid}]})]
+    groups = [clean(g) for g in db.groups.find({"member_ids": uid})]
+    events = [clean(e) for e in db.events.find({"rsvps": uid})]
+    reports = [clean(r) for r in db.reports.find({"reporter_id": uid})]
+
+    payload = {
+        "exported_at": datetime.utcnow().isoformat() + "Z",
+        "profile": profile,
+        "posts": posts,
+        "bookmarks": bookmarks,
+        "connections": connections,
+        "messages": messages,
+        "groups": groups,
+        "events_rsvped": events,
+        "reports_i_made": reports,
+    }
+    # JSON-safe (datetime -> isoformat) and force download as a file
+    body = _json.dumps(payload, default=str, ensure_ascii=False, indent=2)
+    from fastapi.responses import Response
+    return Response(
+        content=body,
+        media_type="application/json",
+        headers={"Content-Disposition": 'attachment; filename="peers-datele-mele.json"'},
+    )
+
+
+@api_router.delete("/auth/me")
+def delete_my_account(current_user: dict = Depends(get_current_user)):
+    """GDPR right to erasure: permanently delete the current user and all their data."""
+    uid = current_user["id"]
+
+    db.users.delete_one({"id": uid})
+    db.posts.delete_many({"user_id": uid})
+    db.connections.delete_many({"$or": [{"from_user_id": uid}, {"to_user_id": uid}]})
+    db.messages.delete_many({"$or": [{"from_user_id": uid}, {"to_user_id": uid}]})
+    db.bookmarks.delete_many({"user_id": uid})
+    db.reports.delete_many({"reporter_id": uid})
+    db.password_resets.delete_many({"user_id": uid})
+    # Remove the user from any group memberships and event RSVPs (shared docs kept)
+    db.groups.update_many({"member_ids": uid}, {"$pull": {"member_ids": uid}})
+    db.events.update_many({"rsvps": uid}, {"$pull": {"rsvps": uid}})
+
+    return {"message": "Account and all associated data permanently deleted"}
+
+
 # ==================== USER ROUTES ====================
 
 @api_router.get("/users", response_model=List[UserResponse])
