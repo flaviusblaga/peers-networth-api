@@ -1181,6 +1181,7 @@ class ApplicationCreate(BaseModel):
     position: str
     experience: Optional[str] = ""          # e.g. "5-10" (years range)
     interests: Optional[List[str]] = []     # multi-select expectations
+    plan: Optional[str] = ""                # desired subscription (from the pricing screen)
     note: Optional[str] = ""                # optional free text
 
 @api_router.post("/applications")
@@ -1204,6 +1205,7 @@ def create_application(data: ApplicationCreate, request: Request):
         "name": name[:120], "email": email[:160], "phone": (data.phone or "").strip()[:40],
         "position": position[:160], "experience": (data.experience or "").strip()[:40],
         "interests": [str(x).strip()[:60] for x in (data.interests or [])][:10],
+        "plan": (data.plan or "").strip()[:120],
         "note": (data.note or "").strip()[:1000],
         "status": "pending", "already_member": already_member,
         "created_at": datetime.utcnow(),
@@ -1224,6 +1226,7 @@ def create_application(data: ApplicationCreate, request: Request):
                 <tr><td style="color:#888;padding:2px 10px 2px 0">Phone</td><td>{esc(doc['phone']) or '—'}</td></tr>
                 <tr><td style="color:#888;padding:2px 10px 2px 0">Position</td><td>{esc(doc['position'])}</td></tr>
                 <tr><td style="color:#888;padding:2px 10px 2px 0">Experience</td><td>{esc(doc['experience']) or '—'} yrs</td></tr>
+                <tr><td style="color:#888;padding:2px 10px 2px 0">Plan dorit</td><td><b>{esc(doc['plan']) or '—'}</b></td></tr>
                 <tr><td style="color:#888;padding:2px 10px 2px 0">Interests</td><td>{esc(ints)}</td></tr>
                 </table>
                 {f'<p style="font-size:14px;color:#333"><b>Note:</b> {esc(doc["note"])}</p>' if doc['note'] else ''}
