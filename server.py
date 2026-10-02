@@ -1,4 +1,4 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Depends, status
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, status, UploadFile, File
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
@@ -114,14 +114,19 @@ MAX_AVATAR_BASE64 = 4 * 1024 * 1024  # 4MB of base64 (~3MB image). Real compress
 # ==================== EMAIL (RESEND) ====================
 RESEND_API_KEY = os.environ.get('RESEND_API_KEY', '')
 FROM_EMAIL = os.environ.get('FROM_EMAIL', 'Peers <onboarding@resend.dev>')
+# Sender for membership approval emails (the invite code). Set MEMBERS_EMAIL to
+# "Peers Members <members@networth.ro>" on Render once networth.ro is verified in Resend.
+MEMBERS_EMAIL = os.environ.get('MEMBERS_EMAIL', FROM_EMAIL)
+# Where new-application notifications go. Defaults to the first admin email.
+ADMIN_NOTIFY_EMAIL = os.environ.get('ADMIN_NOTIFY_EMAIL', '')
 APP_URL = 'https://peers.networth.ro'
 
-def _send_email(to: str, subject: str, html: str) -> bool:
+def _send_email(to: str, subject: str, html: str, from_email: str = None) -> bool:
     """Send email via Resend API. Silently skips if RESEND_API_KEY is not set."""
     if not RESEND_API_KEY or not to:
         return False
     try:
-        data = _json.dumps({"from": FROM_EMAIL, "to": [to], "subject": subject, "html": html}).encode()
+        data = _json.dumps({"from": from_email or FROM_EMAIL, "to": [to], "subject": subject, "html": html}).encode()
         req = urllib.request.Request(
             "https://api.resend.com/emails",
             data=data,
@@ -180,6 +185,57 @@ def _validate_avatar(avatar: Optional[str]):
     if avatar and len(avatar) > MAX_AVATAR_BASE64:
         raise HTTPException(status_code=400, detail="Avatar image is too large (max ~3MB)")
 
+# ==================== IMAGE STORAGE (Cloudflare R2, S3-compatible) ====================
+# Images arrive from the client as base64 data URIs. When R2 is configured we upload
+# them to object storage and keep only the public URL in Mongo (keeps the DB small and
+# API responses light). If R2 is not configured we keep the inline base64 (no breakage).
+R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID")
+R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID")
+R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY")
+R2_BUCKET = os.environ.get("R2_BUCKET")
+R2_PUBLIC_BASE = (os.environ.get("R2_PUBLIC_BASE") or "").rstrip("/")
+_r2_client = None
+_R2_IMG_EXT = {"image/jpeg": "jpg", "image/jpg": "jpg", "image/png": "png",
+               "image/webp": "webp", "image/gif": "gif"}
+
+def _r2_enabled():
+    return all([R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET, R2_PUBLIC_BASE])
+
+def _get_r2():
+    global _r2_client
+    if _r2_client is None:
+        import boto3
+        _r2_client = boto3.client(
+            "s3",
+            endpoint_url=f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
+            aws_access_key_id=R2_ACCESS_KEY_ID,
+            aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+            region_name="auto",
+        )
+    return _r2_client
+
+def _store_image(value, prefix):
+    """If value is a base64 data URI and R2 is configured, upload it and return the public URL.
+    Otherwise return value unchanged (already a URL, empty, or R2 not set up yet)."""
+    if not value or not isinstance(value, str) or not value.startswith("data:image"):
+        return value
+    if not _r2_enabled():
+        return value
+    try:
+        header, b64 = value.split(",", 1)
+        mime = header.split(";")[0].split(":", 1)[1].strip().lower()
+        ext = _R2_IMG_EXT.get(mime, "jpg")
+        raw = base64.b64decode(b64)
+        key = f"{prefix}/{uuid.uuid4().hex}.{ext}"
+        _get_r2().put_object(
+            Bucket=R2_BUCKET, Key=key, Body=raw, ContentType=mime,
+            CacheControl="public, max-age=31536000, immutable",
+        )
+        return f"{R2_PUBLIC_BASE}/{key}"
+    except Exception as e:
+        logging.getLogger("r2").warning(f"R2 upload failed, keeping inline image: {e}")
+        return value
+
 # JWT Configuration
 SECRET_KEY = os.environ.get('SECRET_KEY')
 if not SECRET_KEY:
@@ -206,6 +262,7 @@ class UserBase(BaseModel):
     bio: Optional[str] = ""
     headline: Optional[str] = ""
     location: Optional[str] = ""
+    phone: Optional[str] = ""
     skills: List[str] = []
     experience: List[dict] = []
     language: str = "en"  # "en" or "ro"
@@ -226,6 +283,7 @@ class UserUpdate(BaseModel):
     bio: Optional[str] = None
     headline: Optional[str] = None
     location: Optional[str] = None
+    phone: Optional[str] = None
     skills: Optional[List[str]] = None
     experience: Optional[List[dict]] = None
     language: Optional[str] = None
@@ -503,6 +561,7 @@ def register(user_data: UserCreate, request: Request):
         "bio": user_data.bio or "",
         "headline": user_data.headline or "",
         "location": user_data.location or "",
+        "phone": user_data.phone or "",
         "skills": user_data.skills or [],
         "experience": user_data.experience or [],
         "language": user_data.language or "en",
@@ -529,6 +588,7 @@ def register(user_data: UserCreate, request: Request):
             bio=user_dict["bio"],
             headline=user_dict["headline"],
             location=user_dict["location"],
+            phone=user_dict["phone"],
             skills=user_dict["skills"],
             experience=user_dict["experience"],
             language=user_dict["language"],
@@ -561,6 +621,7 @@ def login(credentials: UserLogin, request: Request):
             bio=user.get("bio", ""),
             headline=user.get("headline", ""),
             location=user.get("location", ""),
+            phone=user.get("phone", ""),
             skills=user.get("skills", []),
             experience=user.get("experience", []),
             language=user.get("language", "en"),
@@ -646,6 +707,7 @@ def get_me(current_user: dict = Depends(get_current_user)):
         bio=current_user.get("bio", ""),
         headline=current_user.get("headline", ""),
         location=current_user.get("location", ""),
+        phone=current_user.get("phone", ""),
         skills=current_user.get("skills", []),
         experience=current_user.get("experience", []),
         language=current_user.get("language", "en"),
@@ -662,6 +724,8 @@ def get_me(current_user: dict = Depends(get_current_user)):
 def update_me(update_data: UserUpdate, current_user: dict = Depends(get_current_user)):
     _validate_avatar(update_data.avatar)
     update_dict = {k: v for k, v in update_data.dict().items() if v is not None}
+    if update_dict.get("avatar"):
+        update_dict["avatar"] = _store_image(update_dict["avatar"], "avatars")
     if update_dict:
         db.users.update_one({"id": current_user["id"]}, {"$set": update_dict})
     
@@ -676,6 +740,7 @@ def update_me(update_data: UserUpdate, current_user: dict = Depends(get_current_
         bio=updated_user.get("bio", ""),
         headline=updated_user.get("headline", ""),
         location=updated_user.get("location", ""),
+        phone=updated_user.get("phone", ""),
         skills=updated_user.get("skills", []),
         experience=updated_user.get("experience", []),
         language=updated_user.get("language", "en"),
@@ -745,6 +810,12 @@ def delete_my_account(current_user: dict = Depends(get_current_user)):
     db.connections.delete_many({"$or": [{"from_user_id": uid}, {"to_user_id": uid}]})
     db.messages.delete_many({"$or": [{"from_user_id": uid}, {"to_user_id": uid}]})
     db.bookmarks.delete_many({"user_id": uid})
+    db.board.delete_many({"user_id": uid})
+    db.intros.delete_many({"$or": [{"requester_id": uid}, {"via_id": uid}, {"target_id": uid}]})
+    db.slots.delete_many({"$or": [{"host_id": uid}, {"booked_by_id": uid}]})
+    db.endorsements.delete_many({"$or": [{"user_id": uid}, {"endorser_id": uid}]})
+    db.resources.delete_many({"user_id": uid})
+    db.jobs.delete_many({"user_id": uid})
     db.reports.delete_many({"reporter_id": uid})
     db.password_resets.delete_many({"user_id": uid})
     # Remove the user from any group memberships and event RSVPs (shared docs kept)
@@ -752,6 +823,612 @@ def delete_my_account(current_user: dict = Depends(get_current_user)):
     db.events.update_many({"rsvps": uid}, {"$pull": {"rsvps": uid}})
 
     return {"message": "Account and all associated data permanently deleted"}
+
+
+# ==================== IMAGE UPLOAD (multipart -> R2) ====================
+@api_router.post("/upload")
+async def upload_image(file: UploadFile = File(...), current_user: dict = Depends(get_current_user)):
+    """Upload an image as a real file. Stores it in R2 and returns its public URL.
+    If R2 isn't configured yet, returns a base64 data URI so the app still works."""
+    raw = await file.read()
+    if len(raw) > 6 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="Image too large (max 6MB)")
+    ct = (file.content_type or "image/jpeg").lower()
+    ext = _R2_IMG_EXT.get(ct, "jpg")
+    if _r2_enabled():
+        try:
+            key = f"uploads/{uuid.uuid4().hex}.{ext}"
+            _get_r2().put_object(Bucket=R2_BUCKET, Key=key, Body=raw, ContentType=ct,
+                                 CacheControl="public, max-age=31536000, immutable")
+            return {"url": f"{R2_PUBLIC_BASE}/{key}"}
+        except Exception as e:
+            logging.getLogger("r2").warning(f"upload failed, falling back to data URI: {e}")
+    return {"url": f"data:{ct};base64," + base64.b64encode(raw).decode()}
+
+
+@api_router.post("/upload-doc")
+async def upload_doc(file: UploadFile = File(...), current_user: dict = Depends(get_current_user)):
+    """Upload a PDF document (e.g. a job description / announcement). Stores it in R2 and
+    returns its public URL + original filename. Falls back to a base64 data URI if R2 isn't set up."""
+    raw = await file.read()
+    if len(raw) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="File too large (max 10MB)")
+    ct = (file.content_type or "").lower()
+    if ct != "application/pdf" and not (file.filename or "").lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are allowed")
+    ct = "application/pdf"
+    name = (file.filename or "document.pdf")[:160]
+    if _r2_enabled():
+        try:
+            key = f"docs/{uuid.uuid4().hex}.pdf"
+            _get_r2().put_object(Bucket=R2_BUCKET, Key=key, Body=raw, ContentType=ct,
+                                 CacheControl="public, max-age=31536000, immutable")
+            return {"url": f"{R2_PUBLIC_BASE}/{key}", "name": name}
+        except Exception as e:
+            logging.getLogger("r2").warning(f"doc upload failed, falling back to data URI: {e}")
+    return {"url": f"data:{ct};base64," + base64.b64encode(raw).decode(), "name": name}
+
+
+# ==================== NEWS / MARKET DATA ====================
+_fx_cache = {"ts": 0.0, "data": None}
+FX_CURRENCIES = ["EUR", "USD", "GBP", "CHF"]
+_FX_UA = "Mozilla/5.0 (compatible; PeersApp/1.0; +https://peers.networth.ro)"
+
+def _fx_fetch_json(url):
+    req = urllib.request.Request(url, headers={"User-Agent": _FX_UA, "Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return _json.loads(r.read().decode("utf-8"))
+
+@api_router.get("/fx")
+def get_fx():
+    """RON reference rates (ECB via Frankfurter, fallback er-api), cached ~3h.
+    rate = RON per 1 unit of the currency."""
+    now = time.time()
+    if _fx_cache["data"] and now - _fx_cache["ts"] < 3 * 3600:
+        return _fx_cache["data"]
+    data = None
+    # Primary: Frankfurter (ECB reference rates)
+    try:
+        d = _fx_fetch_json("https://api.frankfurter.app/latest?base=RON&symbols=EUR,USD,GBP,CHF")
+        rates = {c: round(1.0 / v, 4) for c, v in d.get("rates", {}).items() if v}
+        if rates:
+            data = {"base": "RON", "date": d.get("date"), "rates": rates, "source": "BCE"}
+    except Exception as e:
+        logging.getLogger("fx").warning(f"frankfurter failed: {e}")
+    # Fallback: open.er-api.com
+    if not data:
+        try:
+            d = _fx_fetch_json("https://open.er-api.com/v6/latest/RON")
+            r = d.get("rates", {})
+            rates = {c: round(1.0 / r[c], 4) for c in FX_CURRENCIES if r.get(c)}
+            if rates:
+                date = (d.get("time_last_update_utc") or "")[:16]
+                data = {"base": "RON", "date": date, "rates": rates, "source": "exchangerate-api"}
+        except Exception as e:
+            logging.getLogger("fx").warning(f"er-api failed: {e}")
+    if data:
+        _fx_cache["data"] = data
+        _fx_cache["ts"] = now
+        return data
+    if _fx_cache["data"]:
+        return _fx_cache["data"]
+    raise HTTPException(status_code=503, detail="FX data temporarily unavailable")
+
+
+_crypto_cache = {"ts": 0.0, "data": None}
+
+@api_router.get("/crypto")
+def get_crypto():
+    """BTC / ETH / XRP prices in USD with 24h change, cached ~10 min."""
+    now = time.time()
+    if _crypto_cache["data"] and now - _crypto_cache["ts"] < 600:
+        return _crypto_cache["data"]
+    try:
+        d = _fx_fetch_json("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum,ripple&vs_currencies=usd&include_24hr_change=true")
+        m = {"bitcoin": "BTC", "ethereum": "ETH", "ripple": "XRP"}
+        order = {"BTC": 0, "ETH": 1, "XRP": 2}
+        coins = [{"symbol": m[k], "usd": round(v["usd"], 2), "change24h": round(v.get("usd_24h_change", 0.0) or 0.0, 2)}
+                 for k, v in d.items() if k in m]
+        coins.sort(key=lambda c: order.get(c["symbol"], 9))
+        data = {"coins": coins}
+        _crypto_cache["data"] = data
+        _crypto_cache["ts"] = now
+        return data
+    except Exception as e:
+        logging.getLogger("crypto").warning(f"coingecko failed: {e}")
+        if _crypto_cache["data"]:
+            return _crypto_cache["data"]
+        raise HTTPException(status_code=503, detail="Crypto data unavailable")
+
+
+_bet_cache = {"ts": 0.0, "data": None}
+
+@api_router.get("/bet")
+def get_bet():
+    """BET index (Bucharest) from stocks.networth.ro, cached ~15 min."""
+    import re
+    now = time.time()
+    if _bet_cache["data"] and now - _bet_cache["ts"] < 900:
+        return _bet_cache["data"]
+    try:
+        d = _fx_fetch_json("https://stocks.networth.ro/api/analysis.php")
+        summary = d.get("summary", "") or ""
+        m = re.search(r"BET\s*([+-]?[\d.,]+)\s*%\s*\(([\d.,]+)", summary)
+        data = {
+            "index": "BET",
+            "change": m.group(1) if m else None,   # e.g. "-1,60"
+            "value": m.group(2) if m else None,    # e.g. "30.521,03"
+            "date": d.get("snapshotDate") or d.get("date"),
+            "source": "stocks.networth.ro",
+        }
+        if data["value"]:
+            _bet_cache["data"] = data
+            _bet_cache["ts"] = now
+        return data
+    except Exception as e:
+        logging.getLogger("bet").warning(f"BET fetch failed: {e}")
+        if _bet_cache["data"]:
+            return _bet_cache["data"]
+        raise HTTPException(status_code=503, detail="BET data unavailable")
+
+
+import xml.etree.ElementTree as _ET
+_news_cache = {"ts": 0.0, "data": None}
+
+@api_router.get("/news")
+def get_news():
+    """Curated news feed for the community — Romanian business/economy headlines, cached ~30 min."""
+    now = time.time()
+    if _news_cache["data"] and now - _news_cache["ts"] < 1800:
+        return _news_cache["data"]
+    try:
+        url = "https://news.google.com/rss/search?q=(economie%20OR%20business%20OR%20bursa)%20Romania%20when:7d&hl=ro&gl=RO&ceid=RO:ro"
+        req = urllib.request.Request(url, headers={"User-Agent": _FX_UA})
+        xml = urllib.request.urlopen(req, timeout=12).read().decode("utf-8")
+        root = _ET.fromstring(xml)
+        items = []
+        for it in root.findall(".//item")[:14]:
+            title = (it.findtext("title") or "").strip()
+            link = (it.findtext("link") or "").strip()
+            pub = (it.findtext("pubDate") or "").strip()
+            src_el = it.find("source")
+            source = (src_el.text or "").strip() if src_el is not None else ""
+            if source and title.endswith(" - " + source):
+                title = title[: -(len(source) + 3)]
+            items.append({"title": title, "link": link, "published": pub, "source": source})
+        data = {"items": items}
+        _news_cache["data"] = data
+        _news_cache["ts"] = now
+        return data
+    except Exception as e:
+        logging.getLogger("news").warning(f"news feed failed: {e}")
+        if _news_cache["data"]:
+            return _news_cache["data"]
+        raise HTTPException(status_code=503, detail="News unavailable")
+
+
+# ==================== ASK & OFFER BOARD ====================
+class BoardCreate(BaseModel):
+    type: str  # 'ask' | 'offer'
+    title: str
+    description: Optional[str] = ""
+    tags: Optional[List[str]] = None
+
+@api_router.post("/board")
+def create_board(data: BoardCreate, current_user: dict = Depends(get_current_user)):
+    if data.type not in ("ask", "offer"):
+        raise HTTPException(status_code=400, detail="Invalid type")
+    title = (data.title or "").strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="Title is required")
+    doc = {
+        "id": str(uuid.uuid4()),
+        "user_id": current_user["id"],
+        "user_name": current_user["name"],
+        "user_headline": current_user.get("headline", ""),
+        "user_avatar": current_user.get("avatar"),
+        "type": data.type,
+        "title": title[:160],
+        "description": (data.description or "").strip()[:2000],
+        "tags": data.tags or [],
+        "status": "open",
+        "created_at": datetime.utcnow(),
+    }
+    db.board.insert_one(doc)
+    doc.pop("_id", None)
+    return doc
+
+@api_router.get("/board")
+def list_board(type: Optional[str] = None, current_user: dict = Depends(get_current_user)):
+    q = {"status": "open"}
+    if type in ("ask", "offer"):
+        q["type"] = type
+    return list(db.board.find(q, {"_id": 0}).sort("created_at", -1).limit(100))
+
+@api_router.post("/board/{item_id}/close")
+def close_board(item_id: str, current_user: dict = Depends(get_current_user)):
+    it = db.board.find_one({"id": item_id})
+    if not it:
+        raise HTTPException(status_code=404, detail="Not found")
+    if it["user_id"] != current_user["id"]:
+        raise HTTPException(status_code=403, detail="Not allowed")
+    db.board.update_one({"id": item_id}, {"$set": {"status": "closed"}})
+    return {"message": "closed"}
+
+@api_router.delete("/board/{item_id}")
+def delete_board(item_id: str, current_user: dict = Depends(get_current_user)):
+    it = db.board.find_one({"id": item_id})
+    if not it:
+        raise HTTPException(status_code=404, detail="Not found")
+    is_admin = current_user.get("is_admin") or current_user.get("email") in ADMIN_EMAILS
+    if it["user_id"] != current_user["id"] and not is_admin:
+        raise HTTPException(status_code=403, detail="Not allowed")
+    db.board.delete_one({"id": item_id})
+    return {"message": "deleted"}
+
+
+# ==================== RESOURCE LIBRARY ====================
+class ResourceCreate(BaseModel):
+    title: str
+    url: str
+    description: Optional[str] = ""
+    category: Optional[str] = ""
+
+@api_router.post("/resources")
+def create_resource(data: ResourceCreate, current_user: dict = Depends(get_current_user)):
+    title = (data.title or "").strip()
+    url = (data.url or "").strip()
+    if not title or not url:
+        raise HTTPException(status_code=400, detail="Title and link are required")
+    if not url.startswith("http"):
+        url = "https://" + url
+    doc = {
+        "id": str(uuid.uuid4()),
+        "user_id": current_user["id"], "user_name": current_user["name"],
+        "title": title[:160], "url": url[:500], "description": (data.description or "").strip()[:1000],
+        "category": (data.category or "").strip()[:60], "created_at": datetime.utcnow(),
+    }
+    db.resources.insert_one(doc)
+    doc.pop("_id", None)
+    return doc
+
+@api_router.get("/resources")
+def list_resources(current_user: dict = Depends(get_current_user)):
+    return list(db.resources.find({}, {"_id": 0}).sort("created_at", -1).limit(200))
+
+@api_router.delete("/resources/{res_id}")
+def delete_resource(res_id: str, current_user: dict = Depends(get_current_user)):
+    r = db.resources.find_one({"id": res_id})
+    if not r:
+        raise HTTPException(status_code=404, detail="Not found")
+    is_admin = current_user.get("is_admin") or current_user.get("email") in ADMIN_EMAILS
+    if r["user_id"] != current_user["id"] and not is_admin:
+        raise HTTPException(status_code=403, detail="Not allowed")
+    db.resources.delete_one({"id": res_id})
+    return {"message": "deleted"}
+
+
+# ==================== JOB / OPPORTUNITY BOARD ====================
+class JobCreate(BaseModel):
+    title: str
+    kind: Optional[str] = "role"          # role | board | advisory | collab
+    company: Optional[str] = ""
+    location: Optional[str] = ""
+    description: Optional[str] = ""
+    contact: Optional[str] = ""           # email or URL to reach out / refer
+    doc_url: Optional[str] = ""           # attached PDF (job description / announcement)
+    doc_name: Optional[str] = ""
+
+@api_router.post("/jobs")
+def create_job(data: JobCreate, current_user: dict = Depends(get_current_user)):
+    title = (data.title or "").strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="Title is required")
+    kind = (data.kind or "role").strip().lower()
+    if kind not in ("role", "board", "advisory", "collab"):
+        kind = "role"
+    doc = {
+        "id": str(uuid.uuid4()),
+        "user_id": current_user["id"], "user_name": current_user["name"],
+        "title": title[:160], "kind": kind,
+        "company": (data.company or "").strip()[:120],
+        "location": (data.location or "").strip()[:120],
+        "description": (data.description or "").strip()[:2000],
+        "contact": (data.contact or "").strip()[:300],
+        "doc_url": (data.doc_url or "").strip(),
+        "doc_name": (data.doc_name or "").strip()[:160],
+        "open": True, "created_at": datetime.utcnow(),
+    }
+    db.jobs.insert_one(doc)
+    doc.pop("_id", None)
+    return doc
+
+@api_router.get("/jobs")
+def list_jobs(kind: Optional[str] = None, current_user: dict = Depends(get_current_user)):
+    q = {"open": True}
+    if kind and kind != "all":
+        q["kind"] = kind
+    return list(db.jobs.find(q, {"_id": 0}).sort("created_at", -1).limit(200))
+
+@api_router.post("/jobs/{job_id}/close")
+def close_job(job_id: str, current_user: dict = Depends(get_current_user)):
+    j = db.jobs.find_one({"id": job_id})
+    if not j:
+        raise HTTPException(status_code=404, detail="Not found")
+    is_admin = current_user.get("is_admin") or current_user.get("email") in ADMIN_EMAILS
+    if j["user_id"] != current_user["id"] and not is_admin:
+        raise HTTPException(status_code=403, detail="Not allowed")
+    db.jobs.update_one({"id": job_id}, {"$set": {"open": False}})
+    return {"message": "closed"}
+
+@api_router.delete("/jobs/{job_id}")
+def delete_job(job_id: str, current_user: dict = Depends(get_current_user)):
+    j = db.jobs.find_one({"id": job_id})
+    if not j:
+        raise HTTPException(status_code=404, detail="Not found")
+    is_admin = current_user.get("is_admin") or current_user.get("email") in ADMIN_EMAILS
+    if j["user_id"] != current_user["id"] and not is_admin:
+        raise HTTPException(status_code=403, detail="Not allowed")
+    db.jobs.delete_one({"id": job_id})
+    return {"message": "deleted"}
+
+
+# ==================== MEMBERSHIP APPLICATIONS (mini-interview) ====================
+class ApplicationCreate(BaseModel):
+    name: str
+    email: EmailStr
+    phone: Optional[str] = ""
+    position: str
+    experience: Optional[str] = ""          # e.g. "5-10" (years range)
+    interests: Optional[List[str]] = []     # multi-select expectations
+    note: Optional[str] = ""                # optional free text
+
+@api_router.post("/applications")
+def create_application(data: ApplicationCreate, request: Request):
+    """PUBLIC endpoint — a candidate submits a short membership application.
+    Lands in the admin zone; admin reviews, then approves to issue an invite code."""
+    if not auth_limiter.allow(f"apply:{_client_ip(request)}"):
+        raise HTTPException(status_code=429, detail="Too many submissions. Try again later.")
+    name = (data.name or "").strip()
+    position = (data.position or "").strip()
+    email = (data.email or "").strip().lower()
+    if not name or not position:
+        raise HTTPException(status_code=400, detail="Name and current position are required")
+    # Already a member? Still accept the application, admin will see it; but flag duplicates.
+    already_member = db.users.find_one({"email": email}) is not None
+    pending = db.applications.find_one({"email": email, "status": "pending"})
+    if pending:
+        raise HTTPException(status_code=400, detail="You already have a pending application. We'll be in touch.")
+    doc = {
+        "id": str(uuid.uuid4()),
+        "name": name[:120], "email": email[:160], "phone": (data.phone or "").strip()[:40],
+        "position": position[:160], "experience": (data.experience or "").strip()[:40],
+        "interests": [str(x).strip()[:60] for x in (data.interests or [])][:10],
+        "note": (data.note or "").strip()[:1000],
+        "status": "pending", "already_member": already_member,
+        "created_at": datetime.utcnow(),
+    }
+    db.applications.insert_one(doc)
+    # Notify admin (fire-and-forget)
+    try:
+        to = ADMIN_NOTIFY_EMAIL or (ADMIN_EMAILS[0] if ADMIN_EMAILS else "")
+        if to:
+            ints = ", ".join(doc["interests"]) or "—"
+            _send_email(
+                to, f"New Peers membership application: {esc(name)}",
+                f"""<div style="font-family:-apple-system,sans-serif;max-width:520px;margin:0 auto;padding:20px">
+                <h2 style="color:#00BCD4">New membership application</h2>
+                <p><b>{esc(name)}</b>{' (already a member!)' if already_member else ''}</p>
+                <table style="font-size:14px;color:#333">
+                <tr><td style="color:#888;padding:2px 10px 2px 0">Email</td><td>{esc(email)}</td></tr>
+                <tr><td style="color:#888;padding:2px 10px 2px 0">Phone</td><td>{esc(doc['phone']) or '—'}</td></tr>
+                <tr><td style="color:#888;padding:2px 10px 2px 0">Position</td><td>{esc(doc['position'])}</td></tr>
+                <tr><td style="color:#888;padding:2px 10px 2px 0">Experience</td><td>{esc(doc['experience']) or '—'} yrs</td></tr>
+                <tr><td style="color:#888;padding:2px 10px 2px 0">Interests</td><td>{esc(ints)}</td></tr>
+                </table>
+                {f'<p style="font-size:14px;color:#333"><b>Note:</b> {esc(doc["note"])}</p>' if doc['note'] else ''}
+                <p style="margin:18px 0"><a href="{APP_URL}/admin" style="background:#00BCD4;color:#0D0D0D;padding:12px 24px;border-radius:12px;text-decoration:none;font-weight:700">Review in admin</a></p>
+                <p style="color:#888;font-size:12px">— Peers by NetWorth</p></div>""",
+            )
+    except Exception as e:
+        logging.getLogger("applications").warning(f"admin notify failed: {e}")
+    return {"message": "Application received. We'll review it and get back to you by email."}
+
+@api_router.get("/admin/applications")
+def list_applications(status: Optional[str] = None, admin_user: dict = Depends(get_admin_user)):
+    q = {}
+    if status and status != "all":
+        q["status"] = status
+    return list(db.applications.find(q, {"_id": 0}).sort("created_at", -1).limit(300))
+
+@api_router.post("/admin/applications/{app_id}/approve")
+def approve_application(app_id: str, admin_user: dict = Depends(get_admin_user)):
+    a = db.applications.find_one({"id": app_id})
+    if not a:
+        raise HTTPException(status_code=404, detail="Application not found")
+    if a.get("status") == "approved" and a.get("invite_code"):
+        return {"code": a["invite_code"], "message": "Already approved", "emailed": False}
+    # Generate a single-use invite code tied to this application
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    code = "".join(secrets.choice(alphabet) for _ in range(8))
+    db.invite_codes.insert_one({
+        "code": code, "active": True, "max_uses": 1, "used_count": 0, "used_by": [],
+        "note": f"application:{a['email']}", "created_by": admin_user["email"],
+        "created_at": datetime.utcnow(),
+    })
+    db.applications.update_one({"id": app_id}, {"$set": {
+        "status": "approved", "invite_code": code,
+        "approved_by": admin_user["email"], "approved_at": datetime.utcnow(),
+    }})
+    first = (a.get("name", "").split() or ["there"])[0]
+    emailed = _send_email(
+        a["email"], "You're invited to Peers by NetWorth",
+        f"""<div style="font-family:-apple-system,sans-serif;max-width:480px;margin:0 auto;padding:20px">
+        <h2 style="color:#00BCD4">Welcome to Peers</h2>
+        <p>Hi {esc(first)},</p>
+        <p>Your membership application has been approved. Use the invite code below to create your account:</p>
+        <p style="font-size:26px;font-weight:800;letter-spacing:3px;background:#f3f3f3;padding:14px;border-radius:12px;text-align:center;color:#0D0D0D">{code}</p>
+        <p style="margin:20px 0"><a href="{APP_URL}/register" style="background:#00BCD4;color:#0D0D0D;padding:12px 24px;border-radius:12px;text-decoration:none;font-weight:700">Create your account</a></p>
+        <p style="color:#888;font-size:12px">This code is for you and can be used once. — Peers by NetWorth</p></div>""",
+        from_email=MEMBERS_EMAIL,
+    )
+    return {"code": code, "emailed": emailed}
+
+@api_router.post("/admin/applications/{app_id}/reject")
+def reject_application(app_id: str, admin_user: dict = Depends(get_admin_user)):
+    r = db.applications.update_one({"id": app_id}, {"$set": {
+        "status": "rejected", "reviewed_by": admin_user["email"], "reviewed_at": datetime.utcnow(),
+    }})
+    if r.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Application not found")
+    return {"message": "rejected"}
+
+@api_router.delete("/admin/applications/{app_id}")
+def delete_application(app_id: str, admin_user: dict = Depends(get_admin_user)):
+    r = db.applications.delete_one({"id": app_id})
+    if r.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Application not found")
+    return {"message": "deleted"}
+
+
+# ==================== OFFICE HOURS / 1:1 BOOKING ====================
+class SlotCreate(BaseModel):
+    start: str           # "YYYY-MM-DD HH:MM"
+    duration_min: Optional[int] = 30
+    topic: Optional[str] = ""
+
+@api_router.post("/slots")
+def create_slot(data: SlotCreate, current_user: dict = Depends(get_current_user)):
+    start = (data.start or "").strip()
+    if not start:
+        raise HTTPException(status_code=400, detail="Start time is required")
+    doc = {
+        "id": str(uuid.uuid4()),
+        "host_id": current_user["id"], "host_name": current_user["name"], "host_avatar": current_user.get("avatar"),
+        "start": start, "duration_min": int(data.duration_min or 30), "topic": (data.topic or "").strip()[:160],
+        "status": "open", "booked_by_id": None, "booked_by_name": None,
+        "created_at": datetime.utcnow(),
+    }
+    db.slots.insert_one(doc)
+    doc.pop("_id", None)
+    return doc
+
+@api_router.get("/slots")
+def list_slots(mine: Optional[int] = 0, current_user: dict = Depends(get_current_user)):
+    today = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
+    if mine:
+        items = list(db.slots.find({"host_id": current_user["id"]}, {"_id": 0}).sort("start", 1).limit(100))
+    else:
+        items = [s for s in db.slots.find({"status": "open"}, {"_id": 0}).sort("start", 1).limit(200)
+                 if s.get("host_id") != current_user["id"] and (s.get("start") or "") >= today][:100]
+    return items
+
+@api_router.post("/slots/{slot_id}/book")
+def book_slot(slot_id: str, current_user: dict = Depends(get_current_user)):
+    s = db.slots.find_one({"id": slot_id})
+    if not s:
+        raise HTTPException(status_code=404, detail="Not found")
+    if s["status"] != "open":
+        raise HTTPException(status_code=400, detail="Slot no longer available")
+    if s["host_id"] == current_user["id"]:
+        raise HTTPException(status_code=400, detail="Can't book your own slot")
+    db.slots.update_one({"id": slot_id}, {"$set": {"status": "booked", "booked_by_id": current_user["id"], "booked_by_name": current_user["name"]}})
+    _dm(current_user["id"], current_user["name"], s["host_id"], s["host_name"],
+        f"Ți-am rezervat slotul de {s['duration_min']} min din {s['start']}. {s.get('topic','')}".strip())
+    _dm(s["host_id"], s["host_name"], current_user["id"], current_user["name"],
+        f"Rezervare confirmată: {s['start']} ({s['duration_min']} min). Ne auzim atunci.")
+    return {"message": "booked"}
+
+@api_router.delete("/slots/{slot_id}")
+def delete_slot(slot_id: str, current_user: dict = Depends(get_current_user)):
+    s = db.slots.find_one({"id": slot_id})
+    if not s:
+        raise HTTPException(status_code=404, detail="Not found")
+    if s["host_id"] != current_user["id"]:
+        raise HTTPException(status_code=403, detail="Not allowed")
+    db.slots.delete_one({"id": slot_id})
+    return {"message": "deleted"}
+
+
+# ==================== WARM INTRODUCTIONS ====================
+class IntroCreate(BaseModel):
+    target_id: str
+    via_id: str
+    message: Optional[str] = ""
+
+def _accepted_conn_ids(uid: str) -> set:
+    ids = set()
+    for c in db.connections.find({"status": "accepted", "$or": [{"from_user_id": uid}, {"to_user_id": uid}]}):
+        ids.add(c["to_user_id"] if c["from_user_id"] == uid else c["from_user_id"])
+    return ids
+
+def _dm(from_id, from_name, to_id, to_name, content):
+    db.messages.insert_one({
+        "id": str(uuid.uuid4()), "from_user_id": from_id, "from_user_name": from_name,
+        "to_user_id": to_id, "to_user_name": to_name, "content": content,
+        "read": False, "created_at": datetime.utcnow(),
+    })
+
+@api_router.get("/intros/mutuals/{target_id}")
+def intro_mutuals(target_id: str, current_user: dict = Depends(get_current_user)):
+    """People connected to BOTH me and the target — who could introduce us."""
+    mutual = _accepted_conn_ids(current_user["id"]) & _accepted_conn_ids(target_id)
+    mutual.discard(current_user["id"]); mutual.discard(target_id)
+    return list(db.users.find({"id": {"$in": list(mutual)}}, {"id": 1, "name": 1, "avatar": 1, "headline": 1, "_id": 0}))
+
+@api_router.post("/intros")
+def create_intro(data: IntroCreate, current_user: dict = Depends(get_current_user)):
+    if data.target_id == current_user["id"] or data.via_id == current_user["id"]:
+        raise HTTPException(status_code=400, detail="Invalid request")
+    via = db.users.find_one({"id": data.via_id})
+    target = db.users.find_one({"id": data.target_id})
+    if not via or not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    # via must be mutual
+    if data.via_id not in (_accepted_conn_ids(current_user["id"]) & _accepted_conn_ids(data.target_id)):
+        raise HTTPException(status_code=403, detail="That person can't introduce you")
+    doc = {
+        "id": str(uuid.uuid4()),
+        "requester_id": current_user["id"], "requester_name": current_user["name"],
+        "via_id": data.via_id, "via_name": via["name"],
+        "target_id": data.target_id, "target_name": target["name"],
+        "message": (data.message or "").strip()[:500], "status": "pending",
+        "created_at": datetime.utcnow(),
+    }
+    db.intros.insert_one(doc)
+    _dm(current_user["id"], current_user["name"], data.via_id, via["name"],
+        f"[Cerere de intro] Mă poți prezenta lui {target['name']}? {doc['message']}".strip())
+    doc.pop("_id", None)
+    return doc
+
+@api_router.get("/intros/incoming")
+def intros_incoming(current_user: dict = Depends(get_current_user)):
+    return list(db.intros.find({"via_id": current_user["id"], "status": "pending"}, {"_id": 0}).sort("created_at", -1).limit(100))
+
+@api_router.post("/intros/{intro_id}/accept")
+def accept_intro(intro_id: str, current_user: dict = Depends(get_current_user)):
+    it = db.intros.find_one({"id": intro_id})
+    if not it:
+        raise HTTPException(status_code=404, detail="Not found")
+    if it["via_id"] != current_user["id"]:
+        raise HTTPException(status_code=403, detail="Not allowed")
+    db.intros.update_one({"id": intro_id}, {"$set": {"status": "accepted"}})
+    # Introduce the two sides via DM from the connector
+    _dm(current_user["id"], current_user["name"], it["requester_id"], it["requester_name"],
+        f"Te-am conectat cu {it['target_name']}. Puteți vorbi direct acum.")
+    _dm(current_user["id"], current_user["name"], it["target_id"], it["target_name"],
+        f"Ți-l prezint pe {it['requester_name']}. Cred că merită să vorbiți. {it.get('message','')}".strip())
+    return {"message": "accepted"}
+
+@api_router.post("/intros/{intro_id}/decline")
+def decline_intro(intro_id: str, current_user: dict = Depends(get_current_user)):
+    it = db.intros.find_one({"id": intro_id})
+    if not it:
+        raise HTTPException(status_code=404, detail="Not found")
+    if it["via_id"] != current_user["id"]:
+        raise HTTPException(status_code=403, detail="Not allowed")
+    db.intros.update_one({"id": intro_id}, {"$set": {"status": "declined"}})
+    return {"message": "declined"}
 
 
 # ==================== USER ROUTES ====================
@@ -779,7 +1456,9 @@ def get_users(search: Optional[str] = None, current_user: dict = Depends(get_cur
             bio=user.get("bio", ""),
             headline=user.get("headline", ""),
             location=user.get("location", ""),
+            phone=user.get("phone", ""),
             skills=user.get("skills", []),
+            can_help_with=user.get("can_help_with", []),
             experience=user.get("experience", []),
             language=user.get("language", "en"),
             created_at=user["created_at"],
@@ -802,6 +1481,7 @@ def get_user(user_id: str, current_user: dict = Depends(get_current_user)):
         bio=user.get("bio", ""),
         headline=user.get("headline", ""),
         location=user.get("location", ""),
+            phone=user.get("phone", ""),
         skills=user.get("skills", []),
         experience=user.get("experience", []),
         language=user.get("language", "en"),
@@ -811,6 +1491,36 @@ def get_user(user_id: str, current_user: dict = Depends(get_current_user)):
         can_help_with=user.get("can_help_with", []),
         wins=user.get("wins", [])
     )
+
+class EndorseBody(BaseModel):
+    skill: str
+
+@api_router.post("/users/{user_id}/endorse")
+def endorse_user(user_id: str, body: EndorseBody, current_user: dict = Depends(get_current_user)):
+    if user_id == current_user["id"]:
+        raise HTTPException(status_code=400, detail="You can't endorse yourself")
+    skill = (body.skill or "").strip()[:60]
+    if not skill:
+        raise HTTPException(status_code=400, detail="Skill required")
+    existing = db.endorsements.find_one({"user_id": user_id, "endorser_id": current_user["id"], "skill": skill})
+    if existing:
+        db.endorsements.delete_one({"_id": existing["_id"]})
+        return {"endorsed": False}
+    db.endorsements.insert_one({
+        "id": str(uuid.uuid4()), "user_id": user_id, "endorser_id": current_user["id"],
+        "skill": skill, "created_at": datetime.utcnow(),
+    })
+    return {"endorsed": True}
+
+@api_router.get("/users/{user_id}/endorsements")
+def get_endorsements(user_id: str, current_user: dict = Depends(get_current_user)):
+    counts: dict = {}
+    mine: list = []
+    for e in db.endorsements.find({"user_id": user_id}):
+        counts[e["skill"]] = counts.get(e["skill"], 0) + 1
+        if e["endorser_id"] == current_user["id"]:
+            mine.append(e["skill"])
+    return {"counts": counts, "mine": mine}
 
 # ==================== POST ROUTES ====================
 
@@ -823,7 +1533,7 @@ def create_post(post_data: PostCreate, current_user: dict = Depends(get_current_
         "user_name": current_user["name"],
         "user_headline": current_user.get("headline", ""),
         "content": post_data.content,
-        "image": post_data.image,
+        "image": _store_image(post_data.image, "posts"),
         "link": post_data.link,
         "anonymous": bool(post_data.anonymous),
         "category": post_data.category,
@@ -1726,54 +2436,90 @@ def get_admin_stats(admin_user: dict = Depends(get_admin_user)):
         new_posts_today=new_posts_today
     )
 
-@api_router.post("/admin/digest")
-def send_weekly_digest(admin_user: dict = Depends(get_admin_user)):
-    """Send a weekly re-engagement digest email to ALL registered users (admin-triggered)."""
+def _run_weekly_digest(preview: bool = False):
+    """Build the weekly re-engagement digest. If preview=True, returns the rendered HTML +
+    the week's counts + recipient count WITHOUT sending. Otherwise sends to all members and returns counts."""
     week_ago = datetime.utcnow() - timedelta(days=7)
+    today = datetime.utcnow().strftime("%Y-%m-%d")
     sent, skipped = 0, 0
 
-    # Aggregate weekly activity
     new_users = db.users.count_documents({"created_at": {"$gte": week_ago}})
     new_posts = db.posts.count_documents({"created_at": {"$gte": week_ago}})
     new_connections = db.connections.count_documents({"created_at": {"$gte": week_ago}, "status": "accepted"})
-    new_messages = db.messages.count_documents({"created_at": {"$gte": week_ago}})
+    new_asks = db.board.count_documents({"type": "ask", "status": "open", "created_at": {"$gte": week_ago}})
+    new_offers = db.board.count_documents({"type": "offer", "status": "open", "created_at": {"$gte": week_ago}})
+
+    # Recent open asks (titles) to pull people back
+    recent_asks = list(db.board.find({"type": "ask", "status": "open"}, {"title": 1, "_id": 0}).sort("created_at", -1).limit(3))
+    asks_html = "".join(f'<li style="margin:4px 0">{esc(a.get("title",""))}</li>' for a in recent_asks)
+    # Upcoming events (date string >= today)
+    upcoming = [e for e in db.events.find({}, {"title": 1, "date": 1, "city": 1, "_id": 0}).sort("date", 1).limit(20)
+                if (e.get("date") or "")[:10] >= today][:3]
+    events_html = "".join(f'<li style="margin:4px 0">{esc(e.get("title",""))} — {esc((e.get("date") or "")[:16])} {esc(e.get("city",""))}</li>' for e in upcoming)
+
+    blocks = ""
+    if asks_html:
+        blocks += f'<p style="margin:16px 0 4px;font-weight:700">🤝 Cineva are nevoie de ajutor:</p><ul style="margin:0;padding-left:18px;color:#444">{asks_html}</ul>'
+    if events_html:
+        blocks += f'<p style="margin:16px 0 4px;font-weight:700">📅 Evenimente care vin:</p><ul style="margin:0;padding-left:18px;color:#444">{events_html}</ul>'
+
+    def render(name: str) -> str:
+        return (f"""<div style="font-family:-apple-system,sans-serif;max-width:480px;margin:0 auto;padding:20px">
+            <h2 style="color:#00BCD4">📈 Săptămâna ta pe Peers</h2>
+            <p>Salut {esc(name) if name else ''},</p>
+            <p>Ce s-a întâmplat în ultimele 7 zile:</p>
+            <table style="width:100%;border-collapse:collapse;margin:16px 0">
+              <tr><td style="padding:8px;border-bottom:1px solid #eee">👥 Membri noi</td><td style="padding:8px;border-bottom:1px solid #eee;text-align:right;font-weight:700">{new_users}</td></tr>
+              <tr><td style="padding:8px;border-bottom:1px solid #eee">💬 Postări & dileme</td><td style="padding:8px;border-bottom:1px solid #eee;text-align:right;font-weight:700">{new_posts}</td></tr>
+              <tr><td style="padding:8px;border-bottom:1px solid #eee">🙋 Cereri noi (Caut)</td><td style="padding:8px;border-bottom:1px solid #eee;text-align:right;font-weight:700">{new_asks}</td></tr>
+              <tr><td style="padding:8px">🎁 Oferte noi</td><td style="padding:8px;text-align:right;font-weight:700">{new_offers}</td></tr>
+            </table>
+            {blocks}
+            <p style="margin-top:18px">Cineva poate aștepta răspunsul tău — <a href="{APP_URL}/board" style="color:#00BCD4">vezi ce e nou</a>.</p>
+            <p style="color:#888;font-size:12px">— Peers by NetWorth</p></div>""")
 
     active_users = list(db.users.find(
-        {
-            "email": {"$ne": ""},
-            "created_at": {"$lte": week_ago},
-        },
+        {"email": {"$ne": ""}, "is_blocked": {"$ne": True}},
         {"email": 1, "name": 1, "_id": 0},
-    ).limit(500))
+    ).limit(1000))
+    recipients = [u for u in active_users if (u.get("email") or "").strip()]
 
-    for u in active_users:
-        email = (u.get("email") or "").strip()
-        if not email:
-            skipped += 1
-            continue
+    counts = {"new_users": new_users, "new_posts": new_posts, "new_connections": new_connections,
+              "new_asks": new_asks, "new_offers": new_offers,
+              "recent_asks": [a.get("title", "") for a in recent_asks],
+              "upcoming": [{"title": e.get("title", ""), "date": (e.get("date") or "")[:16], "city": e.get("city", "")} for e in upcoming]}
+
+    if preview:
+        # Sample greeting uses the first recipient's name so the admin sees it as members will.
+        sample_name = (recipients[0].get("name") or "").split()[0] if recipients else ""
+        return {"html": render(sample_name), "recipients": len(recipients), "counts": counts}
+
+    for u in recipients:
         name = (u.get("name") or "there").split()[0]
-        ok = _send_email(
-            email,
-            "Your Peers weekly recap",
-            f"""<div style="font-family:-apple-system,sans-serif;max-width:480px;margin:0 auto;padding:20px">
-            <h2 style="color:#00BCD4">📈 Your week on Peers</h2>
-            <p>Hi {esc(name)},</p>
-            <p>Here's what happened in the last 7 days:</p>
-            <table style="width:100%;border-collapse:collapse;margin:16px 0">
-              <tr><td style="padding:8px;border-bottom:1px solid #333">👥 New members</td><td style="padding:8px;border-bottom:1px solid #333;text-align:right;font-weight:700">{new_users}</td></tr>
-              <tr><td style="padding:8px;border-bottom:1px solid #333">💬 New posts & dilemmas</td><td style="padding:8px;border-bottom:1px solid #333;text-align:right;font-weight:700">{new_posts}</td></tr>
-              <tr><td style="padding:8px;border-bottom:1px solid #333">🤝 New connections</td><td style="padding:8px;border-bottom:1px solid #333;text-align:right;font-weight:700">{new_connections}</td></tr>
-              <tr><td style="padding:8px">✉️ New messages</td><td style="padding:8px;text-align:right;font-weight:700">{new_messages}</td></tr>
-            </table>
-            <p>Someone might be waiting for your answer — <a href="{APP_URL}/network" style="color:#00BCD4">see what's new</a>.</p>
-            <p style="color:#888;font-size:12px">— Peers by NetWorth</p></div>"""
-        )
+        ok = _send_email(u["email"].strip(), "Peers — recapul săptămânii", render(name))
         if ok:
             sent += 1
         else:
             skipped += 1
-
     return {"sent": sent, "skipped": skipped}
+
+@api_router.get("/admin/digest/preview")
+def preview_weekly_digest(admin_user: dict = Depends(get_admin_user)):
+    """Build the weekly digest and return its HTML + counts + recipient count, WITHOUT sending."""
+    return _run_weekly_digest(preview=True)
+
+@api_router.post("/admin/digest")
+def send_weekly_digest(admin_user: dict = Depends(get_admin_user)):
+    """Send the weekly digest now (admin-triggered)."""
+    return _run_weekly_digest()
+
+@api_router.get("/cron/digest")
+def cron_digest(key: str = ""):
+    """Weekly digest trigger for cron-job.org. Requires ?key=DIGEST_KEY."""
+    expected = os.environ.get("DIGEST_KEY", "")
+    if not expected or key != expected:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    return _run_weekly_digest()
 
 @api_router.get("/admin/users", response_model=List[UserResponse])
 def get_all_users_admin(admin_user: dict = Depends(get_admin_user)):
@@ -1789,6 +2535,7 @@ def get_all_users_admin(admin_user: dict = Depends(get_admin_user)):
             bio=user.get("bio", ""),
             headline=user.get("headline", ""),
             location=user.get("location", ""),
+            phone=user.get("phone", ""),
             skills=user.get("skills", []),
             experience=user.get("experience", []),
             language=user.get("language", "en"),
