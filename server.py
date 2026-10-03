@@ -1440,6 +1440,24 @@ def decline_intro(intro_id: str, current_user: dict = Depends(get_current_user))
     db.intros.update_one({"id": intro_id}, {"$set": {"status": "declined"}})
     return {"message": "declined"}
 
+class IntroEdit(BaseModel):
+    message: str
+
+@api_router.put("/intros/{intro_id}")
+def edit_intro(intro_id: str, data: IntroEdit, current_user: dict = Depends(get_current_user)):
+    it = db.intros.find_one({"id": intro_id})
+    if not it:
+        raise HTTPException(status_code=404, detail="Not found")
+    if it.get("requester_id") != current_user["id"]:
+        raise HTTPException(status_code=403, detail="Not allowed")
+    if it.get("status") != "pending":
+        raise HTTPException(status_code=400, detail="Can only edit a pending request")
+    msg = (data.message or "").strip()
+    if not msg:
+        raise HTTPException(status_code=400, detail="Message required")
+    db.intros.update_one({"id": intro_id}, {"$set": {"message": msg[:500]}})
+    return {"message": "updated"}
+
 @api_router.delete("/intros/{intro_id}")
 def delete_intro(intro_id: str, current_user: dict = Depends(get_current_user)):
     it = db.intros.find_one({"id": intro_id})
