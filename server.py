@@ -811,7 +811,7 @@ def delete_my_account(current_user: dict = Depends(get_current_user)):
     db.messages.delete_many({"$or": [{"from_user_id": uid}, {"to_user_id": uid}]})
     db.bookmarks.delete_many({"user_id": uid})
     db.board.delete_many({"user_id": uid})
-    db.intros.delete_many({"$or": [{"requester_id": uid}, {"via_id": uid}, {"target_id": uid}]})
+    db.intros.delete_many({"$or": [{"requester_id": uid}, {"recipient_id": uid}]})
     db.slots.delete_many({"$or": [{"host_id": uid}, {"booked_by_id": uid}]})
     db.endorsements.delete_many({"$or": [{"user_id": uid}, {"endorser_id": uid}]})
     db.resources.delete_many({"user_id": uid})
@@ -1355,9 +1355,8 @@ def delete_slot(slot_id: str, current_user: dict = Depends(get_current_user)):
 
 # ==================== WARM INTRODUCTIONS ====================
 class IntroCreate(BaseModel):
-    target_id: str
-    via_id: str
-    message: Optional[str] = ""
+    recipient_id: str                 # a contact of mine I ask for an intro
+    message: Optional[str] = ""       # who/what I want reached in their org
 
 def _accepted_conn_ids(uid: str) -> set:
     ids = set()
@@ -1372,66 +1371,84 @@ def _dm(from_id, from_name, to_id, to_name, content):
         "read": False, "created_at": datetime.utcnow(),
     })
 
-@api_router.get("/intros/mutuals/{target_id}")
-def intro_mutuals(target_id: str, current_user: dict = Depends(get_current_user)):
-    """People connected to BOTH me and the target — who could introduce us."""
-    mutual = _accepted_conn_ids(current_user["id"]) & _accepted_conn_ids(target_id)
-    mutual.discard(current_user["id"]); mutual.discard(target_id)
-    return list(db.users.find({"id": {"$in": list(mutual)}}, {"id": 1, "name": 1, "avatar": 1, "headline": 1, "_id": 0}))
-
 @api_router.post("/intros")
 def create_intro(data: IntroCreate, current_user: dict = Depends(get_current_user)):
-    if data.target_id == current_user["id"] or data.via_id == current_user["id"]:
+    """I ask one of my contacts to introduce me to someone inside their org/network.
+    This is a tracked request (separate from messages), not a DM."""
+    rid = data.recipient_id
+    if rid == current_user["id"]:
         raise HTTPException(status_code=400, detail="Invalid request")
-    via = db.users.find_one({"id": data.via_id})
-    target = db.users.find_one({"id": data.target_id})
-    if not via or not target:
+    recipient = db.users.find_one({"id": rid})
+    if not recipient:
         raise HTTPException(status_code=404, detail="User not found")
-    # via must be mutual
-    if data.via_id not in (_accepted_conn_ids(current_user["id"]) & _accepted_conn_ids(data.target_id)):
-        raise HTTPException(status_code=403, detail="That person can't introduce you")
+    if rid not in _accepted_conn_ids(current_user["id"]):
+        raise HTTPException(status_code=403, detail="You can only ask a contact for an intro")
+    msg = (data.message or "").strip()
+    if not msg:
+        raise HTTPException(status_code=400, detail="Write what intro you want")
     doc = {
         "id": str(uuid.uuid4()),
-        "requester_id": current_user["id"], "requester_name": current_user["name"],
-        "via_id": data.via_id, "via_name": via["name"],
-        "target_id": data.target_id, "target_name": target["name"],
-        "message": (data.message or "").strip()[:500], "status": "pending",
-        "created_at": datetime.utcnow(),
+        "requester_id": current_user["id"], "requester_name": current_user["name"], "requester_avatar": current_user.get("avatar"),
+        "recipient_id": rid, "recipient_name": recipient["name"], "recipient_avatar": recipient.get("avatar"),
+        "message": msg[:500], "status": "pending", "created_at": datetime.utcnow(),
     }
     db.intros.insert_one(doc)
-    _dm(current_user["id"], current_user["name"], data.via_id, via["name"],
-        f"[Cerere de intro] Mă poți prezenta lui {target['name']}? {doc['message']}".strip())
+    # Notify the recipient by email (fire-and-forget); the request shows in their Intro tab.
+    try:
+        if recipient.get("email"):
+            first = (recipient.get("name") or "there").split()[0]
+            _send_email(
+                recipient["email"], f"{current_user['name']} ți-a cerut un intro pe Peers",
+                f"""<div style="font-family:-apple-system,sans-serif;max-width:480px;margin:0 auto;padding:20px">
+                <h2 style="color:#00BCD4">🤝 Cerere de intro</h2>
+                <p>Salut {esc(first)},</p>
+                <p><b>{esc(current_user['name'])}</b> ți-a cerut un intro:</p>
+                <blockquote style="background:#f3f3f3;border-left:3px solid #00BCD4;padding:10px 14px;border-radius:8px;color:#333">{esc(msg)}</blockquote>
+                <p style="margin:18px 0"><a href="{APP_URL}/network" style="background:#00BCD4;color:#0D0D0D;padding:12px 24px;border-radius:12px;text-decoration:none;font-weight:700">Vezi cererea</a></p>
+                <p style="color:#888;font-size:12px">— Peers by NetWorth</p></div>""",
+            )
+    except Exception as e:
+        logging.getLogger("intros").warning(f"notify failed: {e}")
     doc.pop("_id", None)
     return doc
 
+@api_router.get("/intros/sent")
+def intros_sent(current_user: dict = Depends(get_current_user)):
+    return list(db.intros.find({"requester_id": current_user["id"]}, {"_id": 0}).sort("created_at", -1).limit(200))
+
 @api_router.get("/intros/incoming")
 def intros_incoming(current_user: dict = Depends(get_current_user)):
-    return list(db.intros.find({"via_id": current_user["id"], "status": "pending"}, {"_id": 0}).sort("created_at", -1).limit(100))
+    return list(db.intros.find({"recipient_id": current_user["id"]}, {"_id": 0}).sort("created_at", -1).limit(200))
 
-@api_router.post("/intros/{intro_id}/accept")
-def accept_intro(intro_id: str, current_user: dict = Depends(get_current_user)):
+@api_router.post("/intros/{intro_id}/respond")
+def respond_intro(intro_id: str, current_user: dict = Depends(get_current_user)):
     it = db.intros.find_one({"id": intro_id})
     if not it:
         raise HTTPException(status_code=404, detail="Not found")
-    if it["via_id"] != current_user["id"]:
+    if it["recipient_id"] != current_user["id"]:
         raise HTTPException(status_code=403, detail="Not allowed")
-    db.intros.update_one({"id": intro_id}, {"$set": {"status": "accepted"}})
-    # Introduce the two sides via DM from the connector
-    _dm(current_user["id"], current_user["name"], it["requester_id"], it["requester_name"],
-        f"Te-am conectat cu {it['target_name']}. Puteți vorbi direct acum.")
-    _dm(current_user["id"], current_user["name"], it["target_id"], it["target_name"],
-        f"Ți-l prezint pe {it['requester_name']}. Cred că merită să vorbiți. {it.get('message','')}".strip())
-    return {"message": "accepted"}
+    db.intros.update_one({"id": intro_id}, {"$set": {"status": "responded"}})
+    return {"message": "responded"}
 
 @api_router.post("/intros/{intro_id}/decline")
 def decline_intro(intro_id: str, current_user: dict = Depends(get_current_user)):
     it = db.intros.find_one({"id": intro_id})
     if not it:
         raise HTTPException(status_code=404, detail="Not found")
-    if it["via_id"] != current_user["id"]:
+    if it["recipient_id"] != current_user["id"]:
         raise HTTPException(status_code=403, detail="Not allowed")
     db.intros.update_one({"id": intro_id}, {"$set": {"status": "declined"}})
     return {"message": "declined"}
+
+@api_router.delete("/intros/{intro_id}")
+def delete_intro(intro_id: str, current_user: dict = Depends(get_current_user)):
+    it = db.intros.find_one({"id": intro_id})
+    if not it:
+        raise HTTPException(status_code=404, detail="Not found")
+    if current_user["id"] not in (it.get("requester_id"), it.get("recipient_id")):
+        raise HTTPException(status_code=403, detail="Not allowed")
+    db.intros.delete_one({"id": intro_id})
+    return {"message": "deleted"}
 
 
 # ==================== USER ROUTES ====================
