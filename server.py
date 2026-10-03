@@ -1420,15 +1420,31 @@ def intros_sent(current_user: dict = Depends(get_current_user)):
 def intros_incoming(current_user: dict = Depends(get_current_user)):
     return list(db.intros.find({"recipient_id": current_user["id"]}, {"_id": 0}).sort("created_at", -1).limit(200))
 
-@api_router.post("/intros/{intro_id}/respond")
-def respond_intro(intro_id: str, current_user: dict = Depends(get_current_user)):
+class IntroReply(BaseModel):
+    text: str
+
+@api_router.post("/intros/{intro_id}/reply")
+def reply_intro(intro_id: str, data: IntroReply, current_user: dict = Depends(get_current_user)):
+    """Reply inside the intro thread. Either party (requester or recipient) can reply.
+    The whole conversation stays in the Intro section, separate from Messages."""
     it = db.intros.find_one({"id": intro_id})
     if not it:
         raise HTTPException(status_code=404, detail="Not found")
-    if it["recipient_id"] != current_user["id"]:
+    if current_user["id"] not in (it.get("requester_id"), it.get("recipient_id")):
         raise HTTPException(status_code=403, detail="Not allowed")
-    db.intros.update_one({"id": intro_id}, {"$set": {"status": "responded"}})
-    return {"message": "responded"}
+    txt = (data.text or "").strip()
+    if not txt:
+        raise HTTPException(status_code=400, detail="Message required")
+    reply = {
+        "id": str(uuid.uuid4()), "from_id": current_user["id"], "from_name": current_user["name"],
+        "text": txt[:1000], "created_at": datetime.utcnow(),
+    }
+    upd = {"$push": {"replies": reply}}
+    # When the recipient replies to a pending request, mark it responded.
+    if current_user["id"] == it.get("recipient_id") and it.get("status") == "pending":
+        upd["$set"] = {"status": "responded"}
+    db.intros.update_one({"id": intro_id}, upd)
+    return reply
 
 @api_router.post("/intros/{intro_id}/decline")
 def decline_intro(intro_id: str, current_user: dict = Depends(get_current_user)):
