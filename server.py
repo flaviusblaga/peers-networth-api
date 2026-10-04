@@ -298,6 +298,7 @@ class UserResponse(UserBase):
     avatar: Optional[str] = None
     is_admin: bool = False
     is_blocked: bool = False
+    membership_tier: str = "online"   # "online" | "club"
 
 class TokenResponse(BaseModel):
     access_token: str
@@ -467,6 +468,7 @@ class AdminUserUpdate(BaseModel):
     is_admin: Optional[bool] = None
     is_blocked: Optional[bool] = None
     new_password: Optional[str] = None  # admin forced password reset
+    membership_tier: Optional[str] = None  # "online" | "club"
 
 # ==================== HELPERS ====================
 
@@ -567,6 +569,7 @@ def register(user_data: UserCreate, request: Request):
         "language": user_data.language or "en",
         "is_admin": is_admin,
         "is_blocked": False,
+        "membership_tier": "online",
         "can_help_with": [],
         "wins": [],
         "invite_code": used_code,
@@ -595,7 +598,8 @@ def register(user_data: UserCreate, request: Request):
             created_at=user_dict["created_at"],
             connections_count=0,
             is_admin=is_admin,
-            is_blocked=False
+            is_blocked=False,
+            membership_tier="online"
         )
     )
 
@@ -631,7 +635,8 @@ def login(credentials: UserLogin, request: Request):
             can_help_with=user.get("can_help_with", []),
             wins=user.get("wins", []),
             is_admin=is_admin,
-            is_blocked=user.get("is_blocked", False)
+            is_blocked=user.get("is_blocked", False),
+            membership_tier=user.get("membership_tier", "online")
         )
     )
 
@@ -717,7 +722,8 @@ def get_me(current_user: dict = Depends(get_current_user)):
         can_help_with=current_user.get("can_help_with", []),
         wins=current_user.get("wins", []),
         is_admin=is_admin,
-        is_blocked=current_user.get("is_blocked", False)
+        is_blocked=current_user.get("is_blocked", False),
+        membership_tier=current_user.get("membership_tier", "online")
     )
 
 @api_router.put("/auth/me", response_model=UserResponse)
@@ -750,7 +756,8 @@ def update_me(update_data: UserUpdate, current_user: dict = Depends(get_current_
         can_help_with=updated_user.get("can_help_with", []),
         wins=updated_user.get("wins", []),
         is_admin=is_admin,
-        is_blocked=updated_user.get("is_blocked", False)
+        is_blocked=updated_user.get("is_blocked", False),
+        membership_tier=updated_user.get("membership_tier", "online")
     )
 
 # ==================== GDPR: DATA EXPORT & ACCOUNT DELETION ====================
@@ -2599,7 +2606,8 @@ def get_all_users_admin(admin_user: dict = Depends(get_admin_user)):
             can_help_with=user.get("can_help_with", []),
             wins=user.get("wins", []),
             is_admin=is_admin,
-            is_blocked=user.get("is_blocked", False)
+            is_blocked=user.get("is_blocked", False),
+            membership_tier=user.get("membership_tier", "online")
         ))
     return result
 
@@ -2614,6 +2622,9 @@ def update_user_admin(user_id: str, update_data: AdminUserUpdate, admin_user: di
         update_dict["is_admin"] = update_data.is_admin
     if update_data.is_blocked is not None:
         update_dict["is_blocked"] = update_data.is_blocked
+    if update_data.membership_tier is not None:
+        tier = update_data.membership_tier if update_data.membership_tier in ("online", "club") else "online"
+        update_dict["membership_tier"] = tier
     if update_data.new_password:
         # Admin forced reset: hash new password, invalidate any pending email reset code
         update_dict["password_hash"] = get_password_hash(update_data.new_password)
