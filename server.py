@@ -299,6 +299,7 @@ class UserResponse(UserBase):
     is_admin: bool = False
     is_blocked: bool = False
     membership_tier: str = "online"   # "online" | "club"
+    badge: str = ""   # "" | "founder" | "cofounder" | "sbe"
 
 class TokenResponse(BaseModel):
     access_token: str
@@ -469,6 +470,7 @@ class AdminUserUpdate(BaseModel):
     is_blocked: Optional[bool] = None
     new_password: Optional[str] = None  # admin forced password reset
     membership_tier: Optional[str] = None  # "online" | "club"
+    badge: Optional[str] = None  # "" | founder | cofounder | sbe
 
 # ==================== HELPERS ====================
 
@@ -507,6 +509,13 @@ def get_admin_user(current_user: dict = Depends(get_current_user)):
     if not is_admin:
         raise HTTPException(status_code=403, detail="Admin access required")
     return current_user
+
+def get_club_user(current_user: dict = Depends(get_current_user)):
+    """Verify user is a Club member (or an admin). Online members get 403 on Club-only features."""
+    is_admin = current_user.get("is_admin", False) or current_user.get("email") in ADMIN_EMAILS
+    if current_user.get("membership_tier") == "club" or is_admin:
+        return current_user
+    raise HTTPException(status_code=403, detail="Club membership required")
 
 def get_connections_count(user_id: str) -> int:
     count = db.connections.count_documents({
@@ -570,6 +579,7 @@ def register(user_data: UserCreate, request: Request):
         "is_admin": is_admin,
         "is_blocked": False,
         "membership_tier": "online",
+        "badge": "",
         "can_help_with": [],
         "wins": [],
         "invite_code": used_code,
@@ -599,7 +609,8 @@ def register(user_data: UserCreate, request: Request):
             connections_count=0,
             is_admin=is_admin,
             is_blocked=False,
-            membership_tier="online"
+            membership_tier="online",
+            badge=""
         )
     )
 
@@ -636,7 +647,8 @@ def login(credentials: UserLogin, request: Request):
             wins=user.get("wins", []),
             is_admin=is_admin,
             is_blocked=user.get("is_blocked", False),
-            membership_tier=user.get("membership_tier", "online")
+            membership_tier=user.get("membership_tier", "online"),
+            badge=user.get("badge", "")
         )
     )
 
@@ -723,7 +735,8 @@ def get_me(current_user: dict = Depends(get_current_user)):
         wins=current_user.get("wins", []),
         is_admin=is_admin,
         is_blocked=current_user.get("is_blocked", False),
-        membership_tier=current_user.get("membership_tier", "online")
+        membership_tier=current_user.get("membership_tier", "online"),
+        badge=current_user.get("badge", "")
     )
 
 @api_router.put("/auth/me", response_model=UserResponse)
@@ -757,7 +770,8 @@ def update_me(update_data: UserUpdate, current_user: dict = Depends(get_current_
         wins=updated_user.get("wins", []),
         is_admin=is_admin,
         is_blocked=updated_user.get("is_blocked", False),
-        membership_tier=updated_user.get("membership_tier", "online")
+        membership_tier=updated_user.get("membership_tier", "online"),
+        badge=updated_user.get("badge", "")
     )
 
 # ==================== GDPR: DATA EXPORT & ACCOUNT DELETION ====================
@@ -1082,7 +1096,7 @@ class ResourceCreate(BaseModel):
     category: Optional[str] = ""
 
 @api_router.post("/resources")
-def create_resource(data: ResourceCreate, current_user: dict = Depends(get_current_user)):
+def create_resource(data: ResourceCreate, current_user: dict = Depends(get_club_user)):
     title = (data.title or "").strip()
     url = (data.url or "").strip()
     if not title or not url:
@@ -1100,11 +1114,11 @@ def create_resource(data: ResourceCreate, current_user: dict = Depends(get_curre
     return doc
 
 @api_router.get("/resources")
-def list_resources(current_user: dict = Depends(get_current_user)):
+def list_resources(current_user: dict = Depends(get_club_user)):
     return list(db.resources.find({}, {"_id": 0}).sort("created_at", -1).limit(200))
 
 @api_router.delete("/resources/{res_id}")
-def delete_resource(res_id: str, current_user: dict = Depends(get_current_user)):
+def delete_resource(res_id: str, current_user: dict = Depends(get_club_user)):
     r = db.resources.find_one({"id": res_id})
     if not r:
         raise HTTPException(status_code=404, detail="Not found")
@@ -1127,7 +1141,7 @@ class JobCreate(BaseModel):
     doc_name: Optional[str] = ""
 
 @api_router.post("/jobs")
-def create_job(data: JobCreate, current_user: dict = Depends(get_current_user)):
+def create_job(data: JobCreate, current_user: dict = Depends(get_club_user)):
     title = (data.title or "").strip()
     if not title:
         raise HTTPException(status_code=400, detail="Title is required")
@@ -1151,14 +1165,14 @@ def create_job(data: JobCreate, current_user: dict = Depends(get_current_user)):
     return doc
 
 @api_router.get("/jobs")
-def list_jobs(kind: Optional[str] = None, current_user: dict = Depends(get_current_user)):
+def list_jobs(kind: Optional[str] = None, current_user: dict = Depends(get_club_user)):
     q = {"open": True}
     if kind and kind != "all":
         q["kind"] = kind
     return list(db.jobs.find(q, {"_id": 0}).sort("created_at", -1).limit(200))
 
 @api_router.post("/jobs/{job_id}/close")
-def close_job(job_id: str, current_user: dict = Depends(get_current_user)):
+def close_job(job_id: str, current_user: dict = Depends(get_club_user)):
     j = db.jobs.find_one({"id": job_id})
     if not j:
         raise HTTPException(status_code=404, detail="Not found")
@@ -1169,7 +1183,7 @@ def close_job(job_id: str, current_user: dict = Depends(get_current_user)):
     return {"message": "closed"}
 
 @api_router.delete("/jobs/{job_id}")
-def delete_job(job_id: str, current_user: dict = Depends(get_current_user)):
+def delete_job(job_id: str, current_user: dict = Depends(get_club_user)):
     j = db.jobs.find_one({"id": job_id})
     if not j:
         raise HTTPException(status_code=404, detail="Not found")
@@ -1308,7 +1322,7 @@ class SlotCreate(BaseModel):
     topic: Optional[str] = ""
 
 @api_router.post("/slots")
-def create_slot(data: SlotCreate, current_user: dict = Depends(get_current_user)):
+def create_slot(data: SlotCreate, current_user: dict = Depends(get_club_user)):
     start = (data.start or "").strip()
     if not start:
         raise HTTPException(status_code=400, detail="Start time is required")
@@ -1324,7 +1338,7 @@ def create_slot(data: SlotCreate, current_user: dict = Depends(get_current_user)
     return doc
 
 @api_router.get("/slots")
-def list_slots(mine: Optional[int] = 0, current_user: dict = Depends(get_current_user)):
+def list_slots(mine: Optional[int] = 0, current_user: dict = Depends(get_club_user)):
     today = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
     if mine:
         items = list(db.slots.find({"host_id": current_user["id"]}, {"_id": 0}).sort("start", 1).limit(100))
@@ -1334,7 +1348,7 @@ def list_slots(mine: Optional[int] = 0, current_user: dict = Depends(get_current
     return items
 
 @api_router.post("/slots/{slot_id}/book")
-def book_slot(slot_id: str, current_user: dict = Depends(get_current_user)):
+def book_slot(slot_id: str, current_user: dict = Depends(get_club_user)):
     s = db.slots.find_one({"id": slot_id})
     if not s:
         raise HTTPException(status_code=404, detail="Not found")
@@ -1350,7 +1364,7 @@ def book_slot(slot_id: str, current_user: dict = Depends(get_current_user)):
     return {"message": "booked"}
 
 @api_router.delete("/slots/{slot_id}")
-def delete_slot(slot_id: str, current_user: dict = Depends(get_current_user)):
+def delete_slot(slot_id: str, current_user: dict = Depends(get_club_user)):
     s = db.slots.find_one({"id": slot_id})
     if not s:
         raise HTTPException(status_code=404, detail="Not found")
@@ -1379,7 +1393,7 @@ def _dm(from_id, from_name, to_id, to_name, content):
     })
 
 @api_router.post("/intros")
-def create_intro(data: IntroCreate, current_user: dict = Depends(get_current_user)):
+def create_intro(data: IntroCreate, current_user: dict = Depends(get_club_user)):
     """I ask one of my contacts to introduce me to someone inside their org/network.
     This is a tracked request (separate from messages), not a DM."""
     rid = data.recipient_id
@@ -1420,18 +1434,18 @@ def create_intro(data: IntroCreate, current_user: dict = Depends(get_current_use
     return doc
 
 @api_router.get("/intros/sent")
-def intros_sent(current_user: dict = Depends(get_current_user)):
+def intros_sent(current_user: dict = Depends(get_club_user)):
     return list(db.intros.find({"requester_id": current_user["id"]}, {"_id": 0}).sort("created_at", -1).limit(200))
 
 @api_router.get("/intros/incoming")
-def intros_incoming(current_user: dict = Depends(get_current_user)):
+def intros_incoming(current_user: dict = Depends(get_club_user)):
     return list(db.intros.find({"recipient_id": current_user["id"]}, {"_id": 0}).sort("created_at", -1).limit(200))
 
 class IntroReply(BaseModel):
     text: str
 
 @api_router.post("/intros/{intro_id}/reply")
-def reply_intro(intro_id: str, data: IntroReply, current_user: dict = Depends(get_current_user)):
+def reply_intro(intro_id: str, data: IntroReply, current_user: dict = Depends(get_club_user)):
     """Reply inside the intro thread. Either party (requester or recipient) can reply.
     The whole conversation stays in the Intro section, separate from Messages."""
     it = db.intros.find_one({"id": intro_id})
@@ -1454,7 +1468,7 @@ def reply_intro(intro_id: str, data: IntroReply, current_user: dict = Depends(ge
     return reply
 
 @api_router.post("/intros/{intro_id}/decline")
-def decline_intro(intro_id: str, current_user: dict = Depends(get_current_user)):
+def decline_intro(intro_id: str, current_user: dict = Depends(get_club_user)):
     it = db.intros.find_one({"id": intro_id})
     if not it:
         raise HTTPException(status_code=404, detail="Not found")
@@ -1467,7 +1481,7 @@ class IntroEdit(BaseModel):
     message: str
 
 @api_router.put("/intros/{intro_id}")
-def edit_intro(intro_id: str, data: IntroEdit, current_user: dict = Depends(get_current_user)):
+def edit_intro(intro_id: str, data: IntroEdit, current_user: dict = Depends(get_club_user)):
     it = db.intros.find_one({"id": intro_id})
     if not it:
         raise HTTPException(status_code=404, detail="Not found")
@@ -1482,7 +1496,7 @@ def edit_intro(intro_id: str, data: IntroEdit, current_user: dict = Depends(get_
     return {"message": "updated"}
 
 @api_router.delete("/intros/{intro_id}")
-def delete_intro(intro_id: str, current_user: dict = Depends(get_current_user)):
+def delete_intro(intro_id: str, current_user: dict = Depends(get_club_user)):
     it = db.intros.find_one({"id": intro_id})
     if not it:
         raise HTTPException(status_code=404, detail="Not found")
@@ -1557,7 +1571,7 @@ class EndorseBody(BaseModel):
     skill: str
 
 @api_router.post("/users/{user_id}/endorse")
-def endorse_user(user_id: str, body: EndorseBody, current_user: dict = Depends(get_current_user)):
+def endorse_user(user_id: str, body: EndorseBody, current_user: dict = Depends(get_club_user)):
     if user_id == current_user["id"]:
         raise HTTPException(status_code=400, detail="You can't endorse yourself")
     skill = (body.skill or "").strip()[:60]
@@ -1574,7 +1588,7 @@ def endorse_user(user_id: str, body: EndorseBody, current_user: dict = Depends(g
     return {"endorsed": True}
 
 @api_router.get("/users/{user_id}/endorsements")
-def get_endorsements(user_id: str, current_user: dict = Depends(get_current_user)):
+def get_endorsements(user_id: str, current_user: dict = Depends(get_club_user)):
     counts: dict = {}
     mine: list = []
     for e in db.endorsements.find({"user_id": user_id}):
@@ -2097,7 +2111,7 @@ def _serialize_group(group: dict, current_user_id: str) -> GroupResponse:
 
 
 @api_router.post("/groups", response_model=GroupResponse)
-def create_group(payload: GroupCreate, current_user: dict = Depends(get_current_user)):
+def create_group(payload: GroupCreate, current_user: dict = Depends(get_club_user)):
     name = payload.name.strip()
     if not name:
         raise HTTPException(status_code=400, detail="Group name is required")
@@ -2137,7 +2151,7 @@ def create_group(payload: GroupCreate, current_user: dict = Depends(get_current_
 
 
 @api_router.get("/groups", response_model=List[GroupResponse])
-def list_my_groups(current_user: dict = Depends(get_current_user)):
+def list_my_groups(current_user: dict = Depends(get_club_user)):
     groups = list(db.groups.find({"member_ids": current_user["id"]}).sort("created_at", -1).limit(200))
     result = [_serialize_group(g, current_user["id"]) for g in groups]
     # Sort by last_message_time desc, then by created_at desc
@@ -2146,7 +2160,7 @@ def list_my_groups(current_user: dict = Depends(get_current_user)):
 
 
 @api_router.get("/groups/{group_id}", response_model=GroupResponse)
-def get_group(group_id: str, current_user: dict = Depends(get_current_user)):
+def get_group(group_id: str, current_user: dict = Depends(get_club_user)):
     group = db.groups.find_one({"id": group_id})
     if not group:
         raise HTTPException(status_code=404, detail="Group not found")
@@ -2156,7 +2170,7 @@ def get_group(group_id: str, current_user: dict = Depends(get_current_user)):
 
 
 @api_router.put("/groups/{group_id}", response_model=GroupResponse)
-def update_group(group_id: str, payload: GroupUpdate, current_user: dict = Depends(get_current_user)):
+def update_group(group_id: str, payload: GroupUpdate, current_user: dict = Depends(get_club_user)):
     group = db.groups.find_one({"id": group_id})
     if not group:
         raise HTTPException(status_code=404, detail="Group not found")
@@ -2179,7 +2193,7 @@ def update_group(group_id: str, payload: GroupUpdate, current_user: dict = Depen
 
 
 @api_router.delete("/groups/{group_id}")
-def delete_group(group_id: str, current_user: dict = Depends(get_current_user)):
+def delete_group(group_id: str, current_user: dict = Depends(get_club_user)):
     group = db.groups.find_one({"id": group_id})
     if not group:
         raise HTTPException(status_code=404, detail="Group not found")
@@ -2191,7 +2205,7 @@ def delete_group(group_id: str, current_user: dict = Depends(get_current_user)):
 
 
 @api_router.post("/groups/{group_id}/members", response_model=GroupResponse)
-def add_members(group_id: str, payload: GroupMembersAdd, current_user: dict = Depends(get_current_user)):
+def add_members(group_id: str, payload: GroupMembersAdd, current_user: dict = Depends(get_club_user)):
     group = db.groups.find_one({"id": group_id})
     if not group:
         raise HTTPException(status_code=404, detail="Group not found")
@@ -2222,7 +2236,7 @@ def add_members(group_id: str, payload: GroupMembersAdd, current_user: dict = De
 
 
 @api_router.delete("/groups/{group_id}/members/{user_id}", response_model=GroupResponse)
-def remove_member(group_id: str, user_id: str, current_user: dict = Depends(get_current_user)):
+def remove_member(group_id: str, user_id: str, current_user: dict = Depends(get_club_user)):
     group = db.groups.find_one({"id": group_id})
     if not group:
         raise HTTPException(status_code=404, detail="Group not found")
@@ -2257,7 +2271,7 @@ def remove_member(group_id: str, user_id: str, current_user: dict = Depends(get_
 
 
 @api_router.get("/groups/{group_id}/messages", response_model=List[GroupMessageResponse])
-def get_group_messages(group_id: str, current_user: dict = Depends(get_current_user)):
+def get_group_messages(group_id: str, current_user: dict = Depends(get_club_user)):
     group = db.groups.find_one({"id": group_id})
     if not group:
         raise HTTPException(status_code=404, detail="Group not found")
@@ -2274,7 +2288,7 @@ def get_group_messages(group_id: str, current_user: dict = Depends(get_current_u
 
 
 @api_router.post("/groups/{group_id}/messages", response_model=GroupMessageResponse)
-def send_group_message(group_id: str, payload: GroupMessageCreate, current_user: dict = Depends(get_current_user)):
+def send_group_message(group_id: str, payload: GroupMessageCreate, current_user: dict = Depends(get_club_user)):
     group = db.groups.find_one({"id": group_id})
     if not group:
         raise HTTPException(status_code=404, detail="Group not found")
@@ -2313,7 +2327,7 @@ class CircleCreate(BaseModel):
     max_members: Optional[int] = 8
 
 @api_router.get("/circles")
-def list_circles(current_user: dict = Depends(get_current_user)):
+def list_circles(current_user: dict = Depends(get_club_user)):
     circles = list(db.groups.find({"is_circle": True}).sort("created_at", -1).limit(100))
     result = []
     for c in circles:
@@ -2332,7 +2346,7 @@ def list_circles(current_user: dict = Depends(get_current_user)):
     return result
 
 @api_router.post("/circles")
-def create_circle(payload: CircleCreate, current_user: dict = Depends(get_current_user)):
+def create_circle(payload: CircleCreate, current_user: dict = Depends(get_club_user)):
     name = payload.name.strip()
     if not name:
         raise HTTPException(status_code=400, detail="Circle name is required")
@@ -2361,7 +2375,7 @@ def create_circle(payload: CircleCreate, current_user: dict = Depends(get_curren
     return doc
 
 @api_router.post("/circles/{circle_id}/join")
-def join_circle(circle_id: str, current_user: dict = Depends(get_current_user)):
+def join_circle(circle_id: str, current_user: dict = Depends(get_club_user)):
     c = db.groups.find_one({"id": circle_id, "is_circle": True})
     if not c:
         raise HTTPException(status_code=404, detail="Circle not found")
@@ -2385,10 +2399,17 @@ class EventCreate(BaseModel):
     date: Optional[str] = ""  # "YYYY-MM-DD HH:MM"
     description: Optional[str] = ""
     max_seats: Optional[int] = None
+    audience: Optional[str] = "all"  # "all" | "club"
 
 @api_router.get("/events")
-def list_events(current_user: dict = Depends(get_current_user)):
-    events = list(db.events.find({}, {"_id": 0}).sort("date", 1).limit(100))
+def list_events(audience: Optional[str] = None, current_user: dict = Depends(get_current_user)):
+    is_club = current_user.get("membership_tier") == "club" or current_user.get("is_admin") or current_user.get("email") in ADMIN_EMAILS
+    q = {}
+    if audience == "club":
+        q = {"audience": "club"}
+    elif not is_club:
+        q = {"audience": {"$ne": "club"}}  # Online members don't see Club-only events
+    events = list(db.events.find(q, {"_id": 0}).sort("date", 1).limit(100))
     result = []
     for ev in events:
         rsvps = ev.get("rsvps", [])
@@ -2415,6 +2436,7 @@ def create_event(payload: EventCreate, admin_user: dict = Depends(get_admin_user
         "date": (payload.date or "").strip(),
         "description": (payload.description or "").strip(),
         "max_seats": payload.max_seats,
+        "audience": "club" if (payload.audience == "club") else "all",
         "rsvps": [],
         "created_by": admin_user["email"],
         "created_by_id": admin_user["id"],
@@ -2607,7 +2629,8 @@ def get_all_users_admin(admin_user: dict = Depends(get_admin_user)):
             wins=user.get("wins", []),
             is_admin=is_admin,
             is_blocked=user.get("is_blocked", False),
-            membership_tier=user.get("membership_tier", "online")
+            membership_tier=user.get("membership_tier", "online"),
+            badge=user.get("badge", "")
         ))
     return result
 
@@ -2625,6 +2648,8 @@ def update_user_admin(user_id: str, update_data: AdminUserUpdate, admin_user: di
     if update_data.membership_tier is not None:
         tier = update_data.membership_tier if update_data.membership_tier in ("online", "club") else "online"
         update_dict["membership_tier"] = tier
+    if update_data.badge is not None:
+        update_dict["badge"] = update_data.badge if update_data.badge in ("founder", "cofounder", "sbe") else ""
     if update_data.new_password:
         # Admin forced reset: hash new password, invalidate any pending email reset code
         update_dict["password_hash"] = get_password_hash(update_data.new_password)
