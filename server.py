@@ -535,7 +535,10 @@ def register(user_data: UserCreate, request: Request):
         raise HTTPException(status_code=429, detail="Too many registrations. Try again later.")
     _validate_avatar(user_data.avatar)
 
-    # Check if email exists
+    # Normalize email (lowercase + trim) so case/whitespace variants can't create duplicates
+    user_data.email = (user_data.email or "").strip().lower()
+
+    # Check if email exists (DB also has a unique index on email as a hard guard)
     existing = db.users.find_one({"email": user_data.email})
     if existing:
         raise HTTPException(status_code=400, detail="Email already registered")
@@ -619,7 +622,7 @@ def login(credentials: UserLogin, request: Request):
     # Rate limit per IP to slow down credential brute-forcing
     if not auth_limiter.allow(f"login:{_client_ip(request)}"):
         raise HTTPException(status_code=429, detail="Too many login attempts. Try again later.")
-    user = db.users.find_one({"email": credentials.email})
+    user = db.users.find_one({"email": (credentials.email or "").strip().lower()})
     if not user or not verify_password(credentials.password, user["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid email or password")
     
