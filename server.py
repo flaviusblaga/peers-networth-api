@@ -1859,6 +1859,8 @@ def _enrich_connection_avatars(connections: list) -> list:
 @api_router.post("/connections", response_model=ConnectionResponse)
 def create_connection_request(request: ConnectionRequest, current_user: dict = Depends(get_current_user)):
     # Check if connection already exists
+    if request.to_user_id == current_user["id"]:
+        raise HTTPException(status_code=400, detail="You can't connect with yourself")
     existing = db.connections.find_one({
         "$or": [
             {"from_user_id": current_user["id"], "to_user_id": request.to_user_id},
@@ -1866,7 +1868,15 @@ def create_connection_request(request: ConnectionRequest, current_user: dict = D
         ]
     })
     if existing:
-        raise HTTPException(status_code=400, detail="Connection request already exists")
+        st = existing.get("status")
+        if st == "accepted":
+            raise HTTPException(status_code=400, detail="You are already connected")
+        if st == "pending":
+            if existing.get("to_user_id") == current_user["id"]:
+                raise HTTPException(status_code=400, detail="This person already sent you a request — accept it in Requests")
+            raise HTTPException(status_code=400, detail="Request already sent")
+        # rejected (or any other stale state) → remove it and allow a fresh request
+        db.connections.delete_one({"id": existing["id"]})
     
     to_user = db.users.find_one({"id": request.to_user_id})
     if not to_user:
