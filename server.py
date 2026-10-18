@@ -299,6 +299,7 @@ class UserResponse(UserBase):
     connections_count: int = 0
     avatar: Optional[str] = None
     is_admin: bool = False
+    is_moderator: bool = False
     is_blocked: bool = False
     membership_tier: str = "online"   # "online" | "club"
     badge: str = ""   # "" | "founder" | "cofounder" | "sbe"
@@ -472,6 +473,7 @@ class AdminStats(BaseModel):
 
 class AdminUserUpdate(BaseModel):
     is_admin: Optional[bool] = None
+    is_moderator: Optional[bool] = None
     is_blocked: Optional[bool] = None
     new_password: Optional[str] = None  # admin forced password reset
     membership_tier: Optional[str] = None  # "online" | "club"
@@ -696,6 +698,7 @@ def login(credentials: UserLogin, request: Request):
             can_help_with=user.get("can_help_with", []),
             wins=user.get("wins", []),
             is_admin=is_admin,
+            is_moderator=bool(user.get("is_moderator") or is_admin),
             is_blocked=user.get("is_blocked", False),
             membership_tier=user.get("membership_tier", "online"),
             badge=user.get("badge", "")
@@ -784,6 +787,7 @@ def get_me(current_user: dict = Depends(get_current_user)):
         can_help_with=current_user.get("can_help_with", []),
         wins=current_user.get("wins", []),
         is_admin=is_admin,
+        is_moderator=bool(current_user.get("is_moderator") or is_admin),
         is_blocked=current_user.get("is_blocked", False),
         membership_tier=current_user.get("membership_tier", "online"),
         badge=current_user.get("badge", "")
@@ -819,6 +823,7 @@ def update_me(update_data: UserUpdate, current_user: dict = Depends(get_current_
         can_help_with=updated_user.get("can_help_with", []),
         wins=updated_user.get("wins", []),
         is_admin=is_admin,
+        is_moderator=bool(updated_user.get("is_moderator") or is_admin),
         is_blocked=updated_user.get("is_blocked", False),
         membership_tier=updated_user.get("membership_tier", "online"),
         badge=updated_user.get("badge", "")
@@ -2727,6 +2732,7 @@ def get_all_users_admin(admin_user: dict = Depends(get_admin_user)):
             can_help_with=user.get("can_help_with", []),
             wins=user.get("wins", []),
             is_admin=is_admin,
+            is_moderator=bool(user.get("is_moderator")),
             is_blocked=user.get("is_blocked", False),
             membership_tier=user.get("membership_tier", "online"),
             badge=user.get("badge", ""),
@@ -2744,6 +2750,10 @@ def update_user_admin(user_id: str, update_data: AdminUserUpdate, admin_user: di
     update_dict = {}
     if update_data.is_admin is not None:
         update_dict["is_admin"] = update_data.is_admin
+    if update_data.is_moderator is not None:
+        update_dict["is_moderator"] = update_data.is_moderator
+        _mod_log(admin_user, "grant_moderator" if update_data.is_moderator else "revoke_moderator",
+                 "user", user_id, user.get("name", ""))
     if update_data.is_blocked is not None:
         update_dict["is_blocked"] = update_data.is_blocked
         _mod_log(admin_user, "block" if update_data.is_blocked else "unblock",
