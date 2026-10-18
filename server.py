@@ -70,6 +70,8 @@ def ensure_indexes():
         # reports / invite codes
         db.reports.create_index([("id", 1)], unique=True)
         db.reports.create_index([("status", 1)])
+        # moderation audit log
+        db.mod_logs.create_index([("at", -1)])
         db.invite_codes.create_index([("code", 1)], unique=True)
         # bookmarks: unique user+post, list by user
         db.bookmarks.create_index([("user_id", 1), ("post_id", 1)], unique=True)
@@ -300,6 +302,8 @@ class UserResponse(UserBase):
     is_blocked: bool = False
     membership_tier: str = "online"   # "online" | "club"
     badge: str = ""   # "" | "founder" | "cofounder" | "sbe"
+    suspended_until: Optional[datetime] = None  # moderator temporary suspension (populated only in admin/me)
+    warnings: List[dict] = []  # moderator warnings (populated only in admin/me)
 
 class TokenResponse(BaseModel):
     access_token: str
@@ -337,6 +341,7 @@ class PostResponse(BaseModel):
     likes: List[str] = []
     comments: List[dict] = []
     created_at: datetime
+    pinned: Optional[bool] = False  # moderator-pinned to top of feed
     bookmarked: Optional[bool] = False  # set when a user's bookmarks are returned
     reported: Optional[bool] = False  # set when the current user has reported this post
 
@@ -516,6 +521,48 @@ def get_club_user(current_user: dict = Depends(get_current_user)):
     if current_user.get("membership_tier") == "club" or is_admin:
         return current_user
     raise HTTPException(status_code=403, detail="Club membership required")
+
+def is_moderator(user: dict) -> bool:
+    """A moderator can act on any member's content/account. For v1 = admins
+    (members promoted to admin). Separate is_moderator flag honoured if present."""
+    return bool(user.get("is_admin") or user.get("is_moderator") or user.get("email") in ADMIN_EMAILS)
+
+def get_moderator_user(current_user: dict = Depends(get_current_user)):
+    """Verify user is a moderator (admin or promoted member)."""
+    if not is_moderator(current_user):
+        raise HTTPException(status_code=403, detail="Moderator access required")
+    return current_user
+
+def _assert_can_write(current_user: dict):
+    """Block writes from a member under an active temporary suspension."""
+    su = current_user.get("suspended_until")
+    if su:
+        try:
+            if isinstance(su, str):
+                su = datetime.fromisoformat(su.replace("Z", ""))
+        except Exception:
+            su = None
+        if su and su > datetime.utcnow():
+            until = su.strftime("%d.%m.%Y %H:%M")
+            raise HTTPException(status_code=403, detail=f"Cont suspendat de un moderator pana la {until} UTC")
+
+def _mod_log(moderator: dict, action: str, target_type: str, target_id: str = "",
+             target_name: str = "", reason: str = ""):
+    """Append an audit entry for a moderation action."""
+    try:
+        db.mod_logs.insert_one({
+            "id": str(uuid.uuid4()),
+            "action": action,                 # delete_post | delete_comment | pin_post | unpin_post | warn | suspend | unsuspend | block | unblock
+            "target_type": target_type,       # post | comment | user
+            "target_id": target_id,
+            "target_name": target_name,
+            "moderator_id": moderator.get("id"),
+            "moderator_name": moderator.get("name"),
+            "reason": (reason or "")[:500],
+            "at": datetime.utcnow(),
+        })
+    except Exception:
+        pass
 
 def get_connections_count(user_id: str) -> int:
     count = db.connections.count_documents({
@@ -1040,6 +1087,7 @@ class BoardCreate(BaseModel):
 
 @api_router.post("/board")
 def create_board(data: BoardCreate, current_user: dict = Depends(get_current_user)):
+    _assert_can_write(current_user)
     if data.type not in ("ask", "offer"):
         raise HTTPException(status_code=400, detail="Invalid type")
     title = (data.title or "").strip()
@@ -1100,6 +1148,7 @@ class ResourceCreate(BaseModel):
 
 @api_router.post("/resources")
 def create_resource(data: ResourceCreate, current_user: dict = Depends(get_club_user)):
+    _assert_can_write(current_user)
     title = (data.title or "").strip()
     url = (data.url or "").strip()
     if not title or not url:
@@ -1145,6 +1194,7 @@ class JobCreate(BaseModel):
 
 @api_router.post("/jobs")
 def create_job(data: JobCreate, current_user: dict = Depends(get_club_user)):
+    _assert_can_write(current_user)
     title = (data.title or "").strip()
     if not title:
         raise HTTPException(status_code=400, detail="Title is required")
@@ -1399,6 +1449,7 @@ def _dm(from_id, from_name, to_id, to_name, content):
 def create_intro(data: IntroCreate, current_user: dict = Depends(get_club_user)):
     """I ask one of my contacts to introduce me to someone inside their org/network.
     This is a tracked request (separate from messages), not a DM."""
+    _assert_can_write(current_user)
     rid = data.recipient_id
     if rid == current_user["id"]:
         raise HTTPException(status_code=400, detail="Invalid request")
@@ -1604,6 +1655,7 @@ def get_endorsements(user_id: str, current_user: dict = Depends(get_club_user)):
 
 @api_router.post("/posts", response_model=PostResponse)
 def create_post(post_data: PostCreate, current_user: dict = Depends(get_current_user)):
+    _assert_can_write(current_user)
     post_id = str(uuid.uuid4())
     post_dict = {
         "id": post_id,
@@ -1685,7 +1737,7 @@ def get_posts(current_user: dict = Depends(get_current_user)):
             {"user_id": {"$in": list(connection_ids)}},
             {"anonymous": True}
         ]
-    }).sort("created_at", -1).limit(100))
+    }).sort([("pinned", -1), ("created_at", -1)]).limit(100))
     _bm = set(b["post_id"] for b in db.bookmarks.find({"user_id": current_user["id"]}, {"post_id": 1, "_id": 0}))
     _rp = set(r.get("reported_post_id") for r in db.reports.find({"reporter_id": current_user["id"]}, {"reported_post_id": 1, "_id": 0}) if r.get("reported_post_id"))
     for _p in posts:
@@ -1695,7 +1747,7 @@ def get_posts(current_user: dict = Depends(get_current_user)):
 
 @api_router.get("/posts/all", response_model=List[PostResponse])
 def get_all_posts(current_user: dict = Depends(get_current_user)):
-    posts = list(db.posts.find().sort("created_at", -1).limit(100))
+    posts = list(db.posts.find().sort([("pinned", -1), ("created_at", -1)]).limit(100))
     _bm = set(b["post_id"] for b in db.bookmarks.find({"user_id": current_user["id"]}, {"post_id": 1, "_id": 0}))
     _rp = set(r.get("reported_post_id") for r in db.reports.find({"reporter_id": current_user["id"]}, {"reported_post_id": 1, "_id": 0}) if r.get("reported_post_id"))
     for _p in posts:
@@ -1730,10 +1782,11 @@ def like_post(post_id: str, current_user: dict = Depends(get_current_user)):
 
 @api_router.post("/posts/{post_id}/comment", response_model=PostResponse)
 def add_comment(post_id: str, comment_data: CommentCreate, current_user: dict = Depends(get_current_user)):
+    _assert_can_write(current_user)
     post = db.posts.find_one({"id": post_id})
     if not post:
         raise HTTPException(status_code=404, detail="Post not found")
-    
+
     comment = {
         "id": str(uuid.uuid4()),
         "user_id": current_user["id"],
@@ -1798,11 +1851,43 @@ def delete_post(post_id: str, current_user: dict = Depends(get_current_user)):
     post = db.posts.find_one({"id": post_id})
     if not post:
         raise HTTPException(status_code=404, detail="Post not found")
-    if post["user_id"] != current_user["id"]:
+    mod = is_moderator(current_user)
+    if post["user_id"] != current_user["id"] and not mod:
         raise HTTPException(status_code=403, detail="Not authorized")
-    
+
     db.posts.delete_one({"id": post_id})
+    if mod and post["user_id"] != current_user["id"]:
+        _mod_log(current_user, "delete_post", "post", post_id,
+                 post.get("user_name", ""), (post.get("content") or "")[:140])
     return {"message": "Post deleted"}
+
+@api_router.delete("/posts/{post_id}/comments/{comment_id}", response_model=PostResponse)
+def delete_comment(post_id: str, comment_id: str, current_user: dict = Depends(get_current_user)):
+    post = db.posts.find_one({"id": post_id})
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    comment = next((c for c in post.get("comments", []) if c.get("id") == comment_id), None)
+    if not comment:
+        raise HTTPException(status_code=404, detail="Comment not found")
+    mod = is_moderator(current_user)
+    if comment.get("user_id") != current_user["id"] and not mod:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    db.posts.update_one({"id": post_id}, {"$pull": {"comments": {"id": comment_id}}})
+    if mod and comment.get("user_id") != current_user["id"]:
+        _mod_log(current_user, "delete_comment", "comment", comment_id,
+                 comment.get("user_name", ""), (comment.get("content") or "")[:140])
+    return _enrich_post(db.posts.find_one({"id": post_id}))
+
+@api_router.put("/posts/{post_id}/pin", response_model=PostResponse)
+def pin_post(post_id: str, current_user: dict = Depends(get_moderator_user)):
+    post = db.posts.find_one({"id": post_id})
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    pinned = not bool(post.get("pinned"))
+    db.posts.update_one({"id": post_id}, {"$set": {"pinned": pinned}})
+    _mod_log(current_user, "pin_post" if pinned else "unpin_post", "post", post_id,
+             post.get("user_name", ""), (post.get("content") or "")[:140])
+    return _enrich_post(db.posts.find_one({"id": post_id}))
 
 # ==================== BOOKMARK ROUTES ====================
 
@@ -1991,6 +2076,7 @@ def get_connection_status(user_id: str, current_user: dict = Depends(get_current
 
 @api_router.post("/messages", response_model=MessageResponse)
 def send_message(message_data: MessageCreate, current_user: dict = Depends(get_current_user)):
+    _assert_can_write(current_user)
     to_user = db.users.find_one({"id": message_data.to_user_id})
     if not to_user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -2643,7 +2729,9 @@ def get_all_users_admin(admin_user: dict = Depends(get_admin_user)):
             is_admin=is_admin,
             is_blocked=user.get("is_blocked", False),
             membership_tier=user.get("membership_tier", "online"),
-            badge=user.get("badge", "")
+            badge=user.get("badge", ""),
+            suspended_until=user.get("suspended_until"),
+            warnings=[{k: v for k, v in (w or {}).items() if k != "_id"} for w in (user.get("warnings") or [])]
         ))
     return result
 
@@ -2658,6 +2746,8 @@ def update_user_admin(user_id: str, update_data: AdminUserUpdate, admin_user: di
         update_dict["is_admin"] = update_data.is_admin
     if update_data.is_blocked is not None:
         update_dict["is_blocked"] = update_data.is_blocked
+        _mod_log(admin_user, "block" if update_data.is_blocked else "unblock",
+                 "user", user_id, user.get("name", ""))
     if update_data.membership_tier is not None:
         tier = update_data.membership_tier if update_data.membership_tier in ("online", "club") else "online"
         update_dict["membership_tier"] = tier
@@ -2860,6 +2950,93 @@ def update_report_admin(report_id: str, status: str, admin_user: dict = Depends(
     
     db.reports.update_one({"id": report_id}, {"$set": {"status": status}})
     return {"message": "Report updated successfully"}
+
+# ==================== MODERATION ====================
+class WarnCreate(BaseModel):
+    reason: str
+
+class SuspendCreate(BaseModel):
+    days: int = 7
+    reason: Optional[str] = ""
+
+def _notice(user_id: str, user_name: str, moderator: dict, text: str):
+    """Deliver an official moderator notice to a member as a DM."""
+    _dm(moderator.get("id"), "Moderator · Peers", user_id, user_name, text)
+
+@api_router.post("/admin/users/{user_id}/warn")
+def warn_user(user_id: str, data: WarnCreate, moderator: dict = Depends(get_moderator_user)):
+    user = db.users.find_one({"id": user_id})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    reason = (data.reason or "").strip()
+    if not reason:
+        raise HTTPException(status_code=400, detail="Reason is required")
+    entry = {
+        "id": str(uuid.uuid4()), "reason": reason[:500],
+        "by": moderator.get("id"), "by_name": moderator.get("name"),
+        "at": datetime.utcnow(),
+    }
+    db.users.update_one({"id": user_id}, {"$push": {"warnings": entry}})
+    _notice(user_id, user["name"], moderator, f"⚠️ Avertisment de la moderator: {reason}")
+    _mod_log(moderator, "warn", "user", user_id, user.get("name", ""), reason)
+    return {"message": "warned", "warning": entry}
+
+@api_router.post("/admin/users/{user_id}/suspend")
+def suspend_user(user_id: str, data: SuspendCreate, moderator: dict = Depends(get_moderator_user)):
+    user = db.users.find_one({"id": user_id})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    days = max(1, min(int(data.days or 7), 365))
+    until = datetime.utcnow() + timedelta(days=days)
+    reason = (data.reason or "").strip()
+    db.users.update_one({"id": user_id}, {"$set": {
+        "suspended_until": until, "suspended_reason": reason[:500],
+        "suspended_by": moderator.get("name"),
+    }})
+    msg = f"⛔ Cont suspendat {days} zile (pana la {until.strftime('%d.%m.%Y %H:%M')} UTC)."
+    if reason:
+        msg += f" Motiv: {reason}"
+    _notice(user_id, user["name"], moderator, msg)
+    _mod_log(moderator, "suspend", "user", user_id, user.get("name", ""),
+             f"{days}d · {reason}")
+    return {"message": "suspended", "suspended_until": until}
+
+@api_router.post("/admin/users/{user_id}/unsuspend")
+def unsuspend_user(user_id: str, moderator: dict = Depends(get_moderator_user)):
+    user = db.users.find_one({"id": user_id})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    db.users.update_one({"id": user_id}, {"$unset": {
+        "suspended_until": "", "suspended_reason": "", "suspended_by": "",
+    }})
+    _notice(user_id, user["name"], moderator, "✅ Suspendarea a fost ridicata. Bine ai revenit.")
+    _mod_log(moderator, "unsuspend", "user", user_id, user.get("name", ""))
+    return {"message": "unsuspended"}
+
+@api_router.get("/admin/mod-log")
+def get_mod_log(moderator: dict = Depends(get_moderator_user)):
+    return list(db.mod_logs.find({}, {"_id": 0}).sort("at", -1).limit(200))
+
+@api_router.get("/my/moderation")
+def my_moderation(current_user: dict = Depends(get_current_user)):
+    """A member's own standing: active suspension + warnings (for an in-app banner)."""
+    su = current_user.get("suspended_until")
+    active = False
+    if su:
+        try:
+            s = datetime.fromisoformat(su.replace("Z", "")) if isinstance(su, str) else su
+            active = bool(s and s > datetime.utcnow())
+        except Exception:
+            active = False
+    warnings = current_user.get("warnings", []) or []
+    for w in warnings:
+        w.pop("_id", None)
+    return {
+        "suspended": active,
+        "suspended_until": su if active else None,
+        "suspended_reason": current_user.get("suspended_reason", "") if active else "",
+        "warnings": warnings,
+    }
 
 # Include the router
 app.include_router(api_router)
