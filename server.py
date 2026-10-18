@@ -313,7 +313,8 @@ class TokenResponse(BaseModel):
 
 class PostCreate(BaseModel):
     content: str
-    image: Optional[str] = None  # base64
+    image: Optional[str] = None  # base64 (legacy single image)
+    images: Optional[List[str]] = None  # up to 3 images
     link: Optional[str] = None
     anonymous: Optional[bool] = False  # dilemma post - author hidden
     category: Optional[str] = None  # e.g. "cariera", "investitii", "business", "dilema", "general"
@@ -336,6 +337,7 @@ class PostResponse(BaseModel):
     user_avatar: Optional[str] = None
     content: str
     image: Optional[str] = None
+    images: List[str] = []
     link: Optional[str] = None
     category: Optional[str] = None
     tags: Optional[List[str]] = []
@@ -1662,13 +1664,17 @@ def get_endorsements(user_id: str, current_user: dict = Depends(get_club_user)):
 def create_post(post_data: PostCreate, current_user: dict = Depends(get_current_user)):
     _assert_can_write(current_user)
     post_id = str(uuid.uuid4())
+    # Accept up to 3 images; fall back to the legacy single `image` field.
+    raw_imgs = post_data.images if post_data.images else ([post_data.image] if post_data.image else [])
+    stored_imgs = [img for img in (_store_image(x, "posts") for x in raw_imgs[:3] if x) if img]
     post_dict = {
         "id": post_id,
         "user_id": current_user["id"],
         "user_name": current_user["name"],
         "user_headline": current_user.get("headline", ""),
         "content": post_data.content,
-        "image": _store_image(post_data.image, "posts"),
+        "image": stored_imgs[0] if stored_imgs else None,
+        "images": stored_imgs,
         "link": post_data.link,
         "anonymous": bool(post_data.anonymous),
         "category": post_data.category,
@@ -1683,6 +1689,9 @@ def create_post(post_data: PostCreate, current_user: dict = Depends(get_current_
 
 def _enrich_post(post: dict) -> PostResponse:
     """Attach current user avatar (and comment authors' avatars) fetched from users collection."""
+    # Legacy posts stored only `image`; expose a unified `images` list.
+    if not post.get("images") and post.get("image"):
+        post["images"] = [post["image"]]
     if post.get("anonymous"):
         # Dilemma post: mask the author entirely
         post["user_id"] = ""
