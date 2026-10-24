@@ -72,6 +72,9 @@ def ensure_indexes():
         db.reports.create_index([("status", 1)])
         # moderation audit log
         db.mod_logs.create_index([("at", -1)])
+        # topics (interest taxonomy)
+        db.topics.create_index([("id", 1)], unique=True)
+        db.topics.create_index([("status", 1)])
         db.invite_codes.create_index([("code", 1)], unique=True)
         # bookmarks: unique user+post, list by user
         db.bookmarks.create_index([("user_id", 1), ("post_id", 1)], unique=True)
@@ -271,6 +274,10 @@ class UserBase(BaseModel):
     avatar: Optional[str] = None  # base64 image
     can_help_with: List[str] = []
     wins: List[dict] = []  # {id, title, problem, action, result}
+    interests: List[str] = []        # topic slugs the member follows / cares about
+    looking_for: List[str] = []      # what they need help with (topic slugs or free text)
+    goals: dict = {}                 # {current_role, target_role, horizon}
+    onboarded: bool = False          # finished the "build your Peers" wizard
 
 class UserCreate(UserBase):
     password: str
@@ -292,6 +299,10 @@ class UserUpdate(BaseModel):
     avatar: Optional[str] = None  # base64 image
     can_help_with: Optional[List[str]] = None
     wins: Optional[List[dict]] = None
+    interests: Optional[List[str]] = None
+    looking_for: Optional[List[str]] = None
+    goals: Optional[dict] = None
+    onboarded: Optional[bool] = None
 
 class UserResponse(UserBase):
     id: str
@@ -636,6 +647,11 @@ def register(user_data: UserCreate, request: Request):
         "badge": "",
         "can_help_with": [],
         "wins": [],
+        "interests": [],
+        "looking_for": [],
+        "goals": {},
+        "interest_weights": {},
+        "onboarded": False,
         "invite_code": used_code,
         "invite_source": used_source,
         "created_at": datetime.utcnow()
@@ -699,6 +715,10 @@ def login(credentials: UserLogin, request: Request):
             avatar=user.get("avatar"),
             can_help_with=user.get("can_help_with", []),
             wins=user.get("wins", []),
+            interests=user.get("interests", []),
+            looking_for=user.get("looking_for", []),
+            goals=user.get("goals", {}),
+            onboarded=user.get("onboarded", False),
             is_admin=is_admin,
             is_moderator=bool(user.get("is_moderator") or is_admin),
             is_blocked=user.get("is_blocked", False),
@@ -788,6 +808,10 @@ def get_me(current_user: dict = Depends(get_current_user)):
         avatar=current_user.get("avatar"),
         can_help_with=current_user.get("can_help_with", []),
         wins=current_user.get("wins", []),
+        interests=current_user.get("interests", []),
+        looking_for=current_user.get("looking_for", []),
+        goals=current_user.get("goals", {}),
+        onboarded=current_user.get("onboarded", False),
         is_admin=is_admin,
         is_moderator=bool(current_user.get("is_moderator") or is_admin),
         is_blocked=current_user.get("is_blocked", False),
@@ -824,6 +848,10 @@ def update_me(update_data: UserUpdate, current_user: dict = Depends(get_current_
         avatar=updated_user.get("avatar"),
         can_help_with=updated_user.get("can_help_with", []),
         wins=updated_user.get("wins", []),
+        interests=updated_user.get("interests", []),
+        looking_for=updated_user.get("looking_for", []),
+        goals=updated_user.get("goals", {}),
+        onboarded=updated_user.get("onboarded", False),
         is_admin=is_admin,
         is_moderator=bool(updated_user.get("is_moderator") or is_admin),
         is_blocked=updated_user.get("is_blocked", False),
@@ -1625,7 +1653,10 @@ def get_user(user_id: str, current_user: dict = Depends(get_current_user)):
         connections_count=connections_count,
         avatar=user.get("avatar"),
         can_help_with=user.get("can_help_with", []),
-        wins=user.get("wins", [])
+        wins=user.get("wins", []),
+        interests=user.get("interests", []),
+        looking_for=user.get("looking_for", []),
+        goals=user.get("goals", {})
     )
 
 class EndorseBody(BaseModel):
@@ -3057,6 +3088,153 @@ def my_moderation(current_user: dict = Depends(get_current_user)):
         "warnings": warnings,
     }
 
+# ==================== TOPICS (interest taxonomy — foundation) ====================
+import re as _re
+
+TOPIC_APPROVE_THRESHOLD = 10  # a proposed topic auto-approves at this many interested members
+
+STARTER_TOPICS = [
+    ("People management", "Leadership"),
+    ("Leading without authority", "Leadership"),
+    ("Difficult conversations", "Leadership"),
+    ("P&L & budgeting", "Finance"),
+    ("Strategy & OKRs", "Strategy"),
+    ("Negotiation", "Skills"),
+    ("Sales & key accounts", "Commercial"),
+    ("Operations & process", "Operations"),
+    ("Hiring & building teams", "People"),
+    ("Performance & feedback", "People"),
+    ("Stakeholder management", "Leadership"),
+    ("Career to C-level", "Growth"),
+    ("Personal branding", "Growth"),
+    ("Change management", "Leadership"),
+    ("Data & decision-making", "Skills"),
+    ("Product & customer", "Product"),
+    ("Remote & hybrid teams", "People"),
+    ("Time & energy management", "Growth"),
+    ("Fundraising & investors", "Finance"),
+    ("Public speaking", "Skills"),
+]
+
+def _slugify(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = _re.sub(r"[^a-z0-9]+", "-", s).strip("-")
+    return s[:60]
+
+def _seed_topics_if_empty():
+    try:
+        if db.topics.count_documents({}) == 0:
+            now = datetime.utcnow()
+            db.topics.insert_many([{
+                "id": _slugify(n), "name": n, "category": c, "status": "approved",
+                "interested_users": [], "created_by": "system", "created_at": now,
+            } for n, c in STARTER_TOPICS])
+    except Exception as e:
+        logger.warning("Topic seed skipped: %s", e)
+
+class TopicCreate(BaseModel):
+    name: str
+    category: Optional[str] = ""
+
+def _topic_out(t: dict, uid: str) -> dict:
+    iu = t.get("interested_users", []) or []
+    return {
+        "id": t["id"], "name": t["name"], "category": t.get("category", ""),
+        "status": t.get("status", "approved"), "count": len(iu),
+        "following": uid in iu,
+    }
+
+@api_router.get("/topics")
+def list_topics(include_proposed: bool = False, current_user: dict = Depends(get_current_user)):
+    q = {} if include_proposed else {"status": "approved"}
+    topics = list(db.topics.find(q).sort("name", 1).limit(500))
+    uid = current_user["id"]
+    out = [_topic_out(t, uid) for t in topics]
+    # approved first, then by follower count desc, then name
+    out.sort(key=lambda x: (x["status"] != "approved", -x["count"], x["name"].lower()))
+    return out
+
+@api_router.post("/topics/propose")
+def propose_topic(data: TopicCreate, current_user: dict = Depends(get_current_user)):
+    _assert_can_write(current_user)
+    name = (data.name or "").strip()
+    if len(name) < 2:
+        raise HTTPException(status_code=400, detail="Topic name too short")
+    slug = _slugify(name)
+    if not slug:
+        raise HTTPException(status_code=400, detail="Invalid topic name")
+    uid = current_user["id"]
+    existing = db.topics.find_one({"id": slug})
+    if existing:
+        # already exists — just follow it
+        db.topics.update_one({"id": slug}, {"$addToSet": {"interested_users": uid}})
+        db.users.update_one({"id": uid}, {"$addToSet": {"interests": slug}})
+        return _topic_out(db.topics.find_one({"id": slug}), uid)
+    doc = {
+        "id": slug, "name": name[:80], "category": (data.category or "").strip()[:40],
+        "status": "proposed", "interested_users": [uid],
+        "created_by": uid, "created_at": datetime.utcnow(),
+    }
+    db.topics.insert_one(doc)
+    db.users.update_one({"id": uid}, {"$addToSet": {"interests": slug}})
+    return _topic_out(doc, uid)
+
+@api_router.post("/topics/{slug}/follow")
+def follow_topic(slug: str, current_user: dict = Depends(get_current_user)):
+    t = db.topics.find_one({"id": slug})
+    if not t:
+        raise HTTPException(status_code=404, detail="Topic not found")
+    uid = current_user["id"]
+    following = uid in (t.get("interested_users", []) or [])
+    if following:
+        db.topics.update_one({"id": slug}, {"$pull": {"interested_users": uid}})
+        db.users.update_one({"id": uid}, {"$pull": {"interests": slug}, "$unset": {f"interest_weights.{slug}": ""}})
+    else:
+        db.topics.update_one({"id": slug}, {"$addToSet": {"interested_users": uid}})
+        db.users.update_one({"id": uid}, {"$addToSet": {"interests": slug}, "$set": {f"interest_weights.{slug}": 1.0}})
+        # auto-approve a proposed topic once enough members want it
+        t2 = db.topics.find_one({"id": slug})
+        if t2.get("status") == "proposed" and len(t2.get("interested_users", [])) >= TOPIC_APPROVE_THRESHOLD:
+            db.topics.update_one({"id": slug}, {"$set": {"status": "approved"}})
+    return _topic_out(db.topics.find_one({"id": slug}), uid)
+
+@api_router.post("/admin/topics/seed")
+def admin_seed_topics(admin_user: dict = Depends(get_admin_user)):
+    before = db.topics.count_documents({})
+    now = datetime.utcnow()
+    added = 0
+    for n, c in STARTER_TOPICS:
+        slug = _slugify(n)
+        if not db.topics.find_one({"id": slug}):
+            db.topics.insert_one({"id": slug, "name": n, "category": c, "status": "approved",
+                                  "interested_users": [], "created_by": "system", "created_at": now})
+            added += 1
+    return {"before": before, "added": added, "total": db.topics.count_documents({})}
+
+class TopicAdminUpdate(BaseModel):
+    name: Optional[str] = None
+    category: Optional[str] = None
+    status: Optional[str] = None  # approved | proposed | archived
+
+@api_router.put("/admin/topics/{slug}")
+def admin_update_topic(slug: str, data: TopicAdminUpdate, admin_user: dict = Depends(get_admin_user)):
+    t = db.topics.find_one({"id": slug})
+    if not t:
+        raise HTTPException(status_code=404, detail="Topic not found")
+    upd = {}
+    if data.name is not None: upd["name"] = data.name.strip()[:80]
+    if data.category is not None: upd["category"] = data.category.strip()[:40]
+    if data.status in ("approved", "proposed", "archived"): upd["status"] = data.status
+    if upd:
+        db.topics.update_one({"id": slug}, {"$set": upd})
+    return {"message": "updated"}
+
+@api_router.delete("/admin/topics/{slug}")
+def admin_delete_topic(slug: str, admin_user: dict = Depends(get_admin_user)):
+    db.topics.delete_one({"id": slug})
+    db.users.update_many({"interests": slug}, {"$pull": {"interests": slug}})
+    return {"message": "deleted"}
+
 # Include the router
 app.include_router(api_router)
 
@@ -3081,6 +3259,7 @@ logger = logging.getLogger(__name__)
 
 # Ensure indexes at startup (idempotent, non-fatal on failure)
 ensure_indexes()
+_seed_topics_if_empty()
 
 @app.on_event("shutdown")
 def shutdown_db_client():
