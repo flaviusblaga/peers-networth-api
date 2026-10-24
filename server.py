@@ -3235,6 +3235,76 @@ def admin_delete_topic(slug: str, admin_user: dict = Depends(get_admin_user)):
     db.users.update_many({"interests": slug}, {"$pull": {"interests": slug}})
     return {"message": "deleted"}
 
+# ==================== ONBOARDING + PERSONALIZED HOME (step 1) ====================
+class OnboardingData(BaseModel):
+    headline: Optional[str] = None
+    current_role: Optional[str] = None
+    target_role: Optional[str] = None
+    horizon: Optional[str] = None
+    challenge: Optional[str] = None
+    interests: List[str] = []       # topic slugs
+    looking_for: List[str] = []     # topic slugs (needs)
+    can_help_with: List[str] = []   # topic slugs / free text (offers)
+
+@api_router.post("/onboarding")
+def complete_onboarding(data: OnboardingData, current_user: dict = Depends(get_current_user)):
+    interests = [s for s in ([_slugify(x) for x in (data.interests or [])]) if s][:20]
+    weights = {s: 1.0 for s in interests}
+    goals = {
+        "current_role": (data.current_role or "").strip()[:80],
+        "target_role": (data.target_role or "").strip()[:80],
+        "horizon": (data.horizon or "").strip()[:40],
+        "challenge": (data.challenge or "").strip()[:280],
+    }
+    upd = {
+        "interests": interests,
+        "looking_for": [x for x in (data.looking_for or [])][:20],
+        "can_help_with": [x for x in (data.can_help_with or [])][:20],
+        "goals": goals,
+        "interest_weights": weights,
+        "onboarded": True,
+    }
+    if data.headline:
+        upd["headline"] = data.headline.strip()[:120]
+    db.users.update_one({"id": current_user["id"]}, {"$set": upd})
+    if interests:
+        db.topics.update_many({"id": {"$in": interests}}, {"$addToSet": {"interested_users": current_user["id"]}})
+    return {"message": "onboarded", "interests": interests}
+
+@api_router.get("/home/for-you")
+def home_for_you(current_user: dict = Depends(get_current_user)):
+    """Personalized bundles for the Home rail: people to meet + topics to follow."""
+    uid = current_user["id"]
+    me_interests = set(current_user.get("interests", []) or [])
+    me_need = set(current_user.get("looking_for", []) or [])
+    conn_ids = _accepted_conn_ids(uid)
+    candidates = list(db.users.find(
+        {"id": {"$ne": uid}, "is_blocked": {"$ne": True}},
+        {"id": 1, "name": 1, "headline": 1, "avatar": 1, "interests": 1, "can_help_with": 1, "_id": 0}
+    ).limit(400))
+    scored = []
+    for u in candidates:
+        if u["id"] in conn_ids:
+            continue
+        ui = set(u.get("interests", []) or [])
+        help_ = set(u.get("can_help_with", []) or [])
+        shared = me_interests & ui
+        helps = me_need & help_
+        score = len(shared) * 2 + len(helps) * 3
+        if score > 0:
+            reason = ("Can help with " + ", ".join(list(helps)[:2])) if helps else ("Shared interests: " + ", ".join(list(shared)[:2]))
+            scored.append((score, {"id": u["id"], "name": u["name"], "headline": u.get("headline", ""),
+                                   "avatar": u.get("avatar"), "reason": reason}))
+    scored.sort(key=lambda x: -x[0])
+    people = [p for _, p in scored[:6]]
+
+    topics = [t for t in db.topics.find({"status": "approved"}).limit(300)
+              if uid not in (t.get("interested_users", []) or [])]
+    topics.sort(key=lambda t: -len(t.get("interested_users", []) or []))
+    sugg_topics = [{"id": t["id"], "name": t["name"], "category": t.get("category", ""),
+                    "count": len(t.get("interested_users", []) or [])} for t in topics[:6]]
+    return {"people": people, "topics": sugg_topics}
+
 # Include the router
 app.include_router(api_router)
 
