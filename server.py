@@ -153,6 +153,91 @@ def _send_email(to: str, subject: str, html: str, from_email: str = None) -> boo
         logger.warning("Email send failed to %s: %s %s", to, e, body)
         return False
 
+# ==================== CLAUDE (shared: moderation + concierge) ====================
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+CLAUDE_FAST = "claude-haiku-5-5"      # cheap/fast: text + image moderation
+CLAUDE_SMART = "claude-sonnet-5-5"    # stronger: concierge "ask"
+
+def _claude(messages, system=None, model=CLAUDE_FAST, max_tokens=400, effort=None, disable_thinking=False):
+    """Call the Claude Messages API via urllib (no SDK dep). Returns text or None on failure/no key."""
+    if not ANTHROPIC_API_KEY:
+        return None
+    body = {"model": model, "max_tokens": max_tokens, "messages": messages}
+    if system:
+        body["system"] = system
+    if effort:
+        body["output_config"] = {"effort": effort}
+    if disable_thinking:
+        body["thinking"] = {"type": "disabled"}
+    try:
+        req = urllib.request.Request(
+            "https://api.anthropic.com/v1/messages",
+            data=_json.dumps(body).encode(),
+            headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01",
+                     "content-type": "application/json", "User-Agent": "peers-networth/1.0"},
+            method="POST",
+        )
+        resp = urllib.request.urlopen(req, timeout=25)
+        data = _json.loads(resp.read().decode())
+        for block in (data.get("content") or []):
+            if block.get("type") == "text":
+                return (block.get("text") or "").strip()
+        return ""
+    except Exception as e:
+        logger.warning("Claude call failed: %s", e)
+        return None
+
+# Hard block list (RO + EN) — explicit sexual terms + slurs. Instant, free, no AI needed.
+_BAD_WORDS = {
+    "pula", "pizda", "pizdă", "muie", "cur", "futu", "fut", "futai", "coaie", "sloboz",
+    "curva", "curvă", "tarfa", "târfă", "bulangiu", "poponar", "cacat", "căcat", "pulii",
+    "fuck", "fucking", "shit", "cunt", "dick", "pussy", "whore", "slut", "nude", "nudes",
+    "bitch", "nigger", "faggot", "rape", "porn",
+}
+def _wordlist_hit(text: str) -> bool:
+    import re as _re2
+    toks = set(_re2.findall(r"\w+", (text or "").lower(), _re2.UNICODE))
+    return bool(toks & _BAD_WORDS)
+
+_MOD_TEXT_SYSTEM = (
+    "You are a content moderator for Peers, an invite-only professional members club "
+    "(Romanian + English). Decide if a post/comment is acceptable. "
+    "Reply EXACTLY 'ALLOW' or 'BLOCK: <very short reason>'. "
+    "BLOCK only for: sexual/explicit content, nudity, hate speech, slurs, harassment, "
+    "threats, or serious personal insults. "
+    "ALLOW normal professional disagreement, criticism, strong opinions, frustration, and business talk."
+)
+def _moderate_text(text: str):
+    """Returns (ok: bool, reason: str). Wordlist first (free), then Claude for context."""
+    t = (text or "").strip()
+    if not t:
+        return True, ""
+    if _wordlist_hit(t):
+        return False, "limbaj interzis / inappropriate language"
+    if ANTHROPIC_API_KEY:
+        out = _claude([{"role": "user", "content": t[:4000]}], system=_MOD_TEXT_SYSTEM,
+                      model=CLAUDE_FAST, max_tokens=40, effort="low", disable_thinking=True)
+        if out and out.upper().startswith("BLOCK"):
+            reason = out.split(":", 1)[1].strip() if ":" in out else "content not allowed"
+            return False, reason[:120]
+    return True, ""
+
+def _moderate_image_b64(b64: str, media_type: str):
+    """Returns (ok, reason). Uses Claude vision; allows if no API key (can't check)."""
+    if not ANTHROPIC_API_KEY or not b64:
+        return True, ""
+    try:
+        out = _claude([{"role": "user", "content": [
+            {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64}},
+            {"type": "text", "text": "Reply EXACTLY 'ALLOW' or 'BLOCK: <reason>'. BLOCK if the image contains nudity, sexual content, gore/graphic violence, or other explicit material. ALLOW ordinary photos, screenshots, charts, products, people clothed."},
+        ]}], model=CLAUDE_FAST, max_tokens=40, effort="low", disable_thinking=True)
+        if out and out.upper().startswith("BLOCK"):
+            reason = out.split(":", 1)[1].strip() if ":" in out else "image not allowed"
+            return False, reason[:120]
+    except Exception as e:
+        logger.warning("Image moderation failed: %s", e)
+    return True, ""
+
 def _notify_connection_request(recipient_id: str, sender_name: str, sender_headline: str):
     """Send email notification for a new connection request (fire-and-forget)."""
     user = db.users.find_one({"id": recipient_id})
@@ -945,6 +1030,12 @@ async def upload_image(file: UploadFile = File(...), current_user: dict = Depend
         raise HTTPException(status_code=400, detail="Image too large (max 6MB)")
     ct = (file.content_type or "image/jpeg").lower()
     ext = _R2_IMG_EXT.get(ct, "jpg")
+    # Content filter (explicit/nudity) via Claude vision — only if API key set
+    _mt = {"image/jpg": "image/jpeg"}.get(ct, ct)
+    if _mt in ("image/jpeg", "image/png", "image/gif", "image/webp"):
+        _ok, _why = _moderate_image_b64(base64.b64encode(raw).decode(), _mt)
+        if not _ok:
+            raise HTTPException(status_code=400, detail=f"Imagine blocată de filtrul de conținut: {_why}")
     if _r2_enabled():
         try:
             key = f"uploads/{uuid.uuid4().hex}.{ext}"
@@ -1698,6 +1789,9 @@ def get_endorsements(user_id: str, current_user: dict = Depends(get_club_user)):
 @api_router.post("/posts", response_model=PostResponse)
 def create_post(post_data: PostCreate, current_user: dict = Depends(get_current_user)):
     _assert_can_write(current_user)
+    _ok, _why = _moderate_text(post_data.content)
+    if not _ok:
+        raise HTTPException(status_code=400, detail=f"Postare blocată de filtrul de conținut: {_why}")
     post_id = str(uuid.uuid4())
     # Accept up to 3 images; fall back to the legacy single `image` field.
     raw_imgs = post_data.images if post_data.images else ([post_data.image] if post_data.image else [])
@@ -1833,6 +1927,9 @@ def like_post(post_id: str, current_user: dict = Depends(get_current_user)):
 @api_router.post("/posts/{post_id}/comment", response_model=PostResponse)
 def add_comment(post_id: str, comment_data: CommentCreate, current_user: dict = Depends(get_current_user)):
     _assert_can_write(current_user)
+    _ok, _why = _moderate_text(comment_data.content)
+    if not _ok:
+        raise HTTPException(status_code=400, detail=f"Comentariu blocat de filtrul de conținut: {_why}")
     post = db.posts.find_one({"id": post_id})
     if not post:
         raise HTTPException(status_code=404, detail="Post not found")
@@ -3532,6 +3629,55 @@ def concierge_week(current_user: dict = Depends(get_current_user)):
                 track_next = {"track_id": cur["id"], "title": nxt["title"]}
 
     return {"read": read, "person": person, "resource": resource, "event": event, "channel": channel, "track_next": track_next}
+
+class AskBody(BaseModel):
+    question: str
+
+@api_router.post("/concierge/ask")
+def concierge_ask(data: AskBody, current_user: dict = Depends(get_current_user)):
+    """Natural-language concierge: answers the member's question and points to the right people."""
+    q = (data.question or "").strip()
+    if len(q) < 3:
+        raise HTTPException(status_code=400, detail="Write a question")
+    if not ANTHROPIC_API_KEY:
+        return {"answer": None, "disabled": True, "people": []}
+    uid = current_user["id"]
+    name_map = {t["id"]: t["name"] for t in db.topics.find({}, {"id": 1, "name": 1, "_id": 0})}
+    def nm(slugs):
+        return [name_map.get(s, s.replace("-", " ")) for s in (slugs or [])][:5]
+    cands = list(db.users.find(
+        {"id": {"$ne": uid}, "is_blocked": {"$ne": True}},
+        {"id": 1, "name": 1, "headline": 1, "avatar": 1, "can_help_with": 1, "interests": 1, "_id": 0}
+    ).limit(40))
+    lines = []
+    for i, u in enumerate(cands):
+        offers = ", ".join(nm(u.get("can_help_with"))) or "—"
+        ints = ", ".join(nm(u.get("interests"))) or "—"
+        lines.append(f"[{i}] {u.get('name','')} — {u.get('headline','')} — can help with: {offers} — interests: {ints}")
+    directory = "\n".join(lines) or "(no other members yet)"
+    system = (
+        "You are the concierge of Peers, an invite-only professional members club in Romania. "
+        "Help the member with their question by pointing them to the right people in the club. "
+        "Answer concisely (2–4 sentences), in the member's language (Romanian or English, match the question). "
+        "Base recommendations only on the members directory provided. "
+        "At the very end, on its own line, output 'PEOPLE: <comma-separated member indices>' (up to 3 best fits), or 'PEOPLE:' if none fit."
+    )
+    user = f"Member question: {q}\n\nMembers directory:\n{directory}"
+    out = _claude([{"role": "user", "content": user}], system=system, model=CLAUDE_SMART, max_tokens=500, effort="low")
+    if not out:
+        return {"answer": None, "disabled": True, "people": []}
+    import re as _re3
+    answer = out
+    people = []
+    m = _re3.search(r"PEOPLE:\s*([0-9,\s]*)\s*$", out)
+    if m:
+        answer = out[:m.start()].strip()
+        for tok in m.group(1).split(","):
+            tok = tok.strip()
+            if tok.isdigit() and int(tok) < len(cands):
+                c = cands[int(tok)]
+                people.append({"id": c["id"], "name": c.get("name", ""), "headline": c.get("headline", ""), "avatar": c.get("avatar")})
+    return {"answer": answer, "people": people}
 
 @api_router.get("/home/for-you")
 def home_for_you(current_user: dict = Depends(get_current_user)):
