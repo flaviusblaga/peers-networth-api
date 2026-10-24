@@ -330,6 +330,7 @@ class PostCreate(BaseModel):
     anonymous: Optional[bool] = False  # dilemma post - author hidden
     category: Optional[str] = None  # e.g. "cariera", "investitii", "business", "dilema", "general"
     tags: Optional[List[str]] = None  # free-form hashtags
+    topics: Optional[List[str]] = None  # channel topic slugs (up to 3)
 
 class PostUpdate(BaseModel):
     content: Optional[str] = None
@@ -355,6 +356,7 @@ class PostResponse(BaseModel):
     likes: List[str] = []
     comments: List[dict] = []
     created_at: datetime
+    topics: Optional[List[str]] = []  # channel topic slugs
     pinned: Optional[bool] = False  # moderator-pinned to top of feed
     bookmarked: Optional[bool] = False  # set when a user's bookmarks are returned
     reported: Optional[bool] = False  # set when the current user has reported this post
@@ -1710,6 +1712,7 @@ def create_post(post_data: PostCreate, current_user: dict = Depends(get_current_
         "anonymous": bool(post_data.anonymous),
         "category": post_data.category,
         "tags": post_data.tags or [],
+        "topics": [_slugify(x) for x in (post_data.topics or [])][:3],
         "likes": [],
         "comments": [],
         "created_at": datetime.utcnow()
@@ -3197,6 +3200,22 @@ def follow_topic(slug: str, current_user: dict = Depends(get_current_user)):
         if t2.get("status") == "proposed" and len(t2.get("interested_users", [])) >= TOPIC_APPROVE_THRESHOLD:
             db.topics.update_one({"id": slug}, {"$set": {"status": "approved"}})
     return _topic_out(db.topics.find_one({"id": slug}), uid)
+
+@api_router.get("/channels/{slug}")
+def get_channel(slug: str, current_user: dict = Depends(get_current_user)):
+    """A topic channel: the topic meta + the posts tagged into it."""
+    t = db.topics.find_one({"id": slug})
+    if not t:
+        raise HTTPException(status_code=404, detail="Channel not found")
+    uid = current_user["id"]
+    posts = list(db.posts.find({"topics": slug, "anonymous": {"$ne": True}})
+                 .sort([("pinned", -1), ("created_at", -1)]).limit(100))
+    _bm = set(b["post_id"] for b in db.bookmarks.find({"user_id": uid}, {"post_id": 1, "_id": 0}))
+    _rp = set(r.get("reported_post_id") for r in db.reports.find({"reporter_id": uid}, {"reported_post_id": 1, "_id": 0}) if r.get("reported_post_id"))
+    for _p in posts:
+        _p["bookmarked"] = _p.get("id") in _bm
+        _p["reported"] = _p.get("id") in _rp
+    return {"topic": _topic_out(t, uid), "posts": [_enrich_post(p) for p in posts]}
 
 @api_router.post("/admin/topics/seed")
 def admin_seed_topics(admin_user: dict = Depends(get_admin_user)):
