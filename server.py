@@ -3454,6 +3454,85 @@ def get_matches(current_user: dict = Depends(get_current_user)):
     help_me.sort(key=lambda x: -x[0]); i_help.sort(key=lambda x: -x[0])
     return {"help_me": [p for _, p in help_me[:8]], "i_help": [p for _, p in i_help[:8]]}
 
+@api_router.get("/concierge/week")
+def concierge_week(current_user: dict = Depends(get_current_user)):
+    """A weekly personalized digest: a couple of posts to read, one person to meet,
+    one resource, one event, a channel to join and the next track step. Rule-based."""
+    uid = current_user["id"]
+    interests = list(current_user.get("interests", []) or [])
+    me_need = set(current_user.get("looking_for", []) or [])
+    me_offer = set(current_user.get("can_help_with", []) or [])
+    is_club = current_user.get("membership_tier") == "club" or current_user.get("is_admin") or current_user.get("email") in ADMIN_EMAILS
+
+    # --- posts to read (tagged with my interests, else recent) ---
+    posts = []
+    if interests:
+        posts = list(db.posts.find(
+            {"topics": {"$in": interests}, "user_id": {"$ne": uid}, "anonymous": {"$ne": True}}
+        ).sort("created_at", -1).limit(6))
+    if len(posts) < 2:
+        seen = {p["id"] for p in posts}
+        for p in db.posts.find({"user_id": {"$ne": uid}, "anonymous": {"$ne": True}}).sort("created_at", -1).limit(8):
+            if p["id"] not in seen:
+                posts.append(p); seen.add(p["id"])
+            if len(posts) >= 2:
+                break
+    read = [{"id": p["id"], "user_name": p.get("user_name", ""),
+             "excerpt": (p.get("content") or "")[:140], "topics": (p.get("topics") or [])[:2]} for p in posts[:2]]
+
+    # --- one person to meet (offers ∩ my needs, else shared interests) ---
+    conn_ids = _accepted_conn_ids(uid)
+    name_map = {t["id"]: t["name"] for t in db.topics.find({}, {"id": 1, "name": 1, "_id": 0})}
+    best = None; best_score = 0
+    for u in db.users.find({"id": {"$ne": uid}, "is_blocked": {"$ne": True}},
+                           {"id": 1, "name": 1, "headline": 1, "avatar": 1, "interests": 1, "can_help_with": 1, "looking_for": 1, "_id": 0}).limit(400):
+        if u["id"] in conn_ids:
+            continue
+        helps = me_need & set(u.get("can_help_with", []) or [])
+        shared = set(interests) & set(u.get("interests", []) or [])
+        score = len(helps) * 3 + len(shared)
+        if score > best_score:
+            why = list(helps) or list(shared)
+            best_score = score
+            best = {"id": u["id"], "name": u["name"], "headline": u.get("headline", ""), "avatar": u.get("avatar"),
+                    "reason": ", ".join(name_map.get(s, s.replace("-", " ")) for s in why[:2])}
+    person = best
+
+    # --- one resource (Club only) ---
+    resource = None
+    if is_club:
+        r = db.resources.find_one({}, {"_id": 0}, sort=[("created_at", -1)])
+        if r:
+            resource = {"title": r.get("title"), "url": r.get("url"), "description": (r.get("description") or "")[:100]}
+
+    # --- next upcoming event ---
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    ev_q = {"date": {"$gte": today}}
+    if not is_club:
+        ev_q["$or"] = [{"audience": {"$ne": "club"}}, {"audience": {"$exists": False}}]
+    ev = db.events.find_one(ev_q, {"_id": 0}, sort=[("date", 1)])
+    event = {"id": ev.get("id"), "title": ev.get("title"), "date": ev.get("date", "")[:16], "city": ev.get("city", "")} if ev else None
+
+    # --- a channel to join ---
+    channel = None
+    chs = [t for t in db.topics.find({"status": "approved"}).limit(200) if uid not in (t.get("interested_users", []) or [])]
+    chs.sort(key=lambda t: -len(t.get("interested_users", []) or []))
+    if chs:
+        channel = {"id": chs[0]["id"], "name": chs[0]["name"], "count": len(chs[0].get("interested_users", []) or [])}
+
+    # --- next track step ---
+    track_next = None
+    cur = current_user.get("track") or {}
+    if cur.get("id"):
+        tdoc = db.tracks.find_one({"id": cur["id"]})
+        if tdoc:
+            done = set(cur.get("done", []) or [])
+            nxt = next((m for m in tdoc.get("milestones", []) if m["id"] not in done), None)
+            if nxt:
+                track_next = {"track_id": cur["id"], "title": nxt["title"]}
+
+    return {"read": read, "person": person, "resource": resource, "event": event, "channel": channel, "track_next": track_next}
+
 @api_router.get("/home/for-you")
 def home_for_you(current_user: dict = Depends(get_current_user)):
     """Personalized bundles for the Home rail: people to meet + topics to follow."""
