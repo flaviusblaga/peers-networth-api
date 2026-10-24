@@ -3421,6 +3421,39 @@ def complete_onboarding(data: OnboardingData, current_user: dict = Depends(get_c
         db.topics.update_many({"id": {"$in": interests}}, {"$addToSet": {"interested_users": current_user["id"]}})
     return {"message": "onboarded", "interests": interests}
 
+@api_router.get("/matches")
+def get_matches(current_user: dict = Depends(get_current_user)):
+    """Two-way matching: people who can help me (their offers ∩ my needs) and
+    people I can help (my offers ∩ their needs). New people only (not yet connected)."""
+    uid = current_user["id"]
+    me_need = set(current_user.get("looking_for", []) or [])
+    me_offer = set(current_user.get("can_help_with", []) or [])
+    conn_ids = _accepted_conn_ids(uid)
+    # topic slug -> display name
+    name_map = {t["id"]: t["name"] for t in db.topics.find({}, {"id": 1, "name": 1, "_id": 0})}
+    def nm(slugs):
+        return [name_map.get(s, s.replace("-", " ")) for s in slugs]
+
+    candidates = list(db.users.find(
+        {"id": {"$ne": uid}, "is_blocked": {"$ne": True}},
+        {"id": 1, "name": 1, "headline": 1, "avatar": 1, "looking_for": 1, "can_help_with": 1, "_id": 0}
+    ).limit(500))
+    help_me, i_help = [], []
+    for u in candidates:
+        if u["id"] in conn_ids:
+            continue
+        their_offer = set(u.get("can_help_with", []) or [])
+        their_need = set(u.get("looking_for", []) or [])
+        hm = me_need & their_offer
+        ih = me_offer & their_need
+        base = {"id": u["id"], "name": u["name"], "headline": u.get("headline", ""), "avatar": u.get("avatar")}
+        if hm:
+            help_me.append((len(hm), {**base, "topics": nm(list(hm))[:3], "direction": "help_me"}))
+        if ih:
+            i_help.append((len(ih), {**base, "topics": nm(list(ih))[:3], "direction": "i_help"}))
+    help_me.sort(key=lambda x: -x[0]); i_help.sort(key=lambda x: -x[0])
+    return {"help_me": [p for _, p in help_me[:8]], "i_help": [p for _, p in i_help[:8]]}
+
 @api_router.get("/home/for-you")
 def home_for_you(current_user: dict = Depends(get_current_user)):
     """Personalized bundles for the Home rail: people to meet + topics to follow."""
