@@ -75,6 +75,8 @@ def ensure_indexes():
         # topics (interest taxonomy)
         db.topics.create_index([("id", 1)], unique=True)
         db.topics.create_index([("status", 1)])
+        # growth tracks
+        db.tracks.create_index([("id", 1)], unique=True)
         db.invite_codes.create_index([("code", 1)], unique=True)
         # bookmarks: unique user+post, list by user
         db.bookmarks.create_index([("user_id", 1), ("post_id", 1)], unique=True)
@@ -3254,6 +3256,135 @@ def admin_delete_topic(slug: str, admin_user: dict = Depends(get_admin_user)):
     db.users.update_many({"interests": slug}, {"$pull": {"interests": slug}})
     return {"message": "deleted"}
 
+# ==================== GROWTH TRACKS (step 3) ====================
+STARTER_TRACKS = [
+    {
+        "id": "middle-to-senior", "name": "Middle → Senior manager",
+        "from_role": "Middle manager", "to_role": "Senior manager", "horizon": "1–2 years",
+        "description": "From running a team to running a function.",
+        "milestones": [
+            {"id": "one-on-ones", "title": "Master 1:1s & feedback", "detail": "Make your 1:1s the engine of your team — not status updates.", "topics": ["people-management", "performance-feedback"]},
+            {"id": "own-pnl", "title": "Own a P&L line", "detail": "Take real budget responsibility and defend it.", "topics": ["p-l-budgeting"]},
+            {"id": "cross-functional", "title": "Lead a cross-functional project", "detail": "Deliver something that needs teams you don't manage.", "topics": ["stakeholder-management", "change-management"]},
+            {"id": "influence", "title": "Influence without authority", "detail": "Get buy-in from peers and seniors, not just reports.", "topics": ["leading-without-authority"]},
+            {"id": "grow-team", "title": "Build & grow your team", "detail": "Hire, develop and retain the right people.", "topics": ["hiring-building-teams"]},
+            {"id": "present-leadership", "title": "Present to leadership", "detail": "Tell a crisp story to the people above you.", "topics": ["public-speaking", "stakeholder-management"]},
+        ],
+    },
+    {
+        "id": "senior-to-clevel", "name": "Senior manager → C-level",
+        "from_role": "Senior manager", "to_role": "C-level", "horizon": "3–5 years",
+        "description": "From running a function to shaping the company.",
+        "milestones": [
+            {"id": "set-strategy", "title": "Set strategy & OKRs", "detail": "Own the direction, not just the execution.", "topics": ["strategy-okrs"]},
+            {"id": "business-numbers", "title": "Own a business unit's numbers", "detail": "Be accountable for outcomes end to end.", "topics": ["p-l-budgeting", "data-decision-making"]},
+            {"id": "external-network", "title": "Build your external network", "detail": "Peers, partners and investors outside the company.", "topics": ["personal-branding"]},
+            {"id": "board-comms", "title": "Board & stakeholder communication", "detail": "Speak the language of boards and investors.", "topics": ["stakeholder-management", "fundraising-investors"]},
+            {"id": "develop-leaders", "title": "Develop other leaders", "detail": "Multiply yourself through the managers under you.", "topics": ["people-management", "change-management"]},
+            {"id": "thought-leadership", "title": "Personal brand & thought leadership", "detail": "Be known for a point of view in your field.", "topics": ["personal-branding", "public-speaking"]},
+        ],
+    },
+    {
+        "id": "ic-to-manager", "name": "IC → First-time manager",
+        "from_role": "Individual contributor", "to_role": "Manager", "horizon": "1 year",
+        "description": "From doing the work to leading the people who do it.",
+        "milestones": [
+            {"id": "shift-mindset", "title": "Shift from doing to leading", "detail": "Let go of being the best doer.", "topics": ["people-management"]},
+            {"id": "run-1-1s", "title": "Run effective 1:1s", "detail": "Build trust and unblock your people weekly.", "topics": ["people-management"]},
+            {"id": "delegate", "title": "Delegate & set expectations", "detail": "Hand off work without dropping the ball.", "topics": ["people-management", "performance-feedback"]},
+            {"id": "hard-feedback", "title": "Give difficult feedback", "detail": "Say the hard thing, kindly and clearly.", "topics": ["difficult-conversations", "performance-feedback"]},
+            {"id": "first-hires", "title": "Make your first hires", "detail": "Pick people better than you at their job.", "topics": ["hiring-building-teams"]},
+            {"id": "manage-up", "title": "Manage up", "detail": "Keep your own manager informed and aligned.", "topics": ["stakeholder-management"]},
+        ],
+    },
+]
+
+def _seed_tracks_if_empty():
+    try:
+        if db.tracks.count_documents({}) == 0 and STARTER_TRACKS:
+            now = datetime.utcnow()
+            db.tracks.insert_many([{**t, "status": "approved", "created_at": now} for t in STARTER_TRACKS])
+    except Exception as e:
+        logger.warning("Track seed skipped: %s", e)
+
+def _track_summary(t: dict, member_counts: dict = None) -> dict:
+    return {
+        "id": t["id"], "name": t["name"], "from_role": t.get("from_role", ""),
+        "to_role": t.get("to_role", ""), "horizon": t.get("horizon", ""),
+        "description": t.get("description", ""),
+        "milestone_count": len(t.get("milestones", []) or []),
+        "member_count": (member_counts or {}).get(t["id"], 0),
+    }
+
+@api_router.get("/tracks")
+def list_tracks(current_user: dict = Depends(get_current_user)):
+    tracks = list(db.tracks.find({"status": {"$ne": "archived"}}))
+    counts = {}
+    for t in tracks:
+        counts[t["id"]] = db.users.count_documents({"track.id": t["id"]})
+    return [_track_summary(t, counts) for t in tracks]
+
+@api_router.get("/tracks/{track_id}")
+def get_track(track_id: str, current_user: dict = Depends(get_current_user)):
+    t = db.tracks.find_one({"id": track_id}, {"_id": 0})
+    if not t:
+        raise HTTPException(status_code=404, detail="Track not found")
+    return t
+
+@api_router.post("/tracks/{track_id}/start")
+def start_track(track_id: str, current_user: dict = Depends(get_current_user)):
+    t = db.tracks.find_one({"id": track_id})
+    if not t:
+        raise HTTPException(status_code=404, detail="Track not found")
+    cur = current_user.get("track") or {}
+    done = cur.get("done", []) if cur.get("id") == track_id else []
+    db.users.update_one({"id": current_user["id"]},
+                        {"$set": {"track": {"id": track_id, "done": done, "started_at": datetime.utcnow()}}})
+    return {"message": "started", "track_id": track_id}
+
+class MilestoneToggle(BaseModel):
+    done: bool
+
+@api_router.put("/tracks/{track_id}/milestone/{mid}")
+def toggle_milestone(track_id: str, mid: str, data: MilestoneToggle, current_user: dict = Depends(get_current_user)):
+    cur = current_user.get("track") or {}
+    if cur.get("id") != track_id:
+        raise HTTPException(status_code=400, detail="You are not on this track")
+    if data.done:
+        db.users.update_one({"id": current_user["id"]}, {"$addToSet": {"track.done": mid}})
+    else:
+        db.users.update_one({"id": current_user["id"]}, {"$pull": {"track.done": mid}})
+    u = db.users.find_one({"id": current_user["id"]}, {"track": 1, "_id": 0})
+    return {"done": (u.get("track") or {}).get("done", [])}
+
+@api_router.get("/my/track")
+def my_track(current_user: dict = Depends(get_current_user)):
+    cur = current_user.get("track") or {}
+    tid = cur.get("id")
+    if not tid:
+        return {"track": None}
+    t = db.tracks.find_one({"id": tid}, {"_id": 0})
+    if not t:
+        return {"track": None}
+    done = cur.get("done", []) or []
+    total = len(t.get("milestones", []) or []) or 1
+    pct = round(100 * len([m for m in t.get("milestones", []) if m["id"] in done]) / total)
+    cohort = list(db.users.find(
+        {"track.id": tid, "id": {"$ne": current_user["id"]}, "is_blocked": {"$ne": True}},
+        {"id": 1, "name": 1, "headline": 1, "avatar": 1, "_id": 0}
+    ).limit(8))
+    return {"track": t, "done": done, "pct": pct, "started_at": cur.get("started_at"), "cohort": cohort}
+
+@api_router.post("/admin/tracks/seed")
+def admin_seed_tracks(admin_user: dict = Depends(get_admin_user)):
+    before = db.tracks.count_documents({})
+    now = datetime.utcnow()
+    added = 0
+    for t in STARTER_TRACKS:
+        if not db.tracks.find_one({"id": t["id"]}):
+            db.tracks.insert_one({**t, "status": "approved", "created_at": now}); added += 1
+    return {"before": before, "added": added, "total": db.tracks.count_documents({})}
+
 # ==================== ONBOARDING + PERSONALIZED HOME (step 1) ====================
 class OnboardingData(BaseModel):
     headline: Optional[str] = None
@@ -3349,6 +3480,7 @@ logger = logging.getLogger(__name__)
 # Ensure indexes at startup (idempotent, non-fatal on failure)
 ensure_indexes()
 _seed_topics_if_empty()
+_seed_tracks_if_empty()
 
 @app.on_event("shutdown")
 def shutdown_db_client():
