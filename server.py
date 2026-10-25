@@ -436,6 +436,7 @@ class UserUpdate(BaseModel):
 
 class UserResponse(UserBase):
     id: str
+    email: Optional[EmailStr] = None  # omitted on public profiles unless the viewer may see contact
     created_at: datetime
     connections_count: int = 0
     avatar: Optional[str] = None
@@ -1792,22 +1793,46 @@ def get_user(user_id: str, current_user: dict = Depends(get_current_user)):
     user = db.users.find_one({"id": user_id})
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    
+
+    # Contact details (email + phone) are a Club perk: visible to Club members
+    # (and admins), and always to the person viewing their own profile.
+    viewer_is_club = (current_user.get("membership_tier") == "club"
+                      or current_user.get("is_admin")
+                      or current_user.get("email") in ADMIN_EMAILS)
+    show_contact = viewer_is_club or current_user["id"] == user["id"]
+
+    # Relationship of the viewer to this profile, so the UI shows the right action.
+    rel = None
+    if current_user["id"] != user["id"]:
+        c = db.connections.find_one({"$or": [
+            {"from_user_id": current_user["id"], "to_user_id": user["id"]},
+            {"from_user_id": user["id"], "to_user_id": current_user["id"]},
+        ]})
+        if c:
+            if c.get("status") == "accepted":
+                rel = "connected"
+            elif c.get("status") == "pending":
+                rel = "pending_out" if c["from_user_id"] == current_user["id"] else "pending_in"
+
     connections_count = get_connections_count(user["id"])
     return UserResponse(
+        rel=rel,
         id=user["id"],
-        email=user["email"],
+        email=(user["email"] if show_contact else None),
         name=user["name"],
         bio=user.get("bio", ""),
         headline=user.get("headline", ""),
         location=user.get("location", ""),
-            phone=user.get("phone", ""),
+        phone=(user.get("phone", "") if show_contact else ""),
         skills=user.get("skills", []),
         experience=user.get("experience", []),
         language=user.get("language", "en"),
         created_at=user["created_at"],
         connections_count=connections_count,
         avatar=user.get("avatar"),
+        is_admin=user.get("is_admin", False) or user.get("email") in ADMIN_EMAILS,
+        membership_tier=user.get("membership_tier", "online"),
+        badge=user.get("badge", ""),
         can_help_with=user.get("can_help_with", []),
         wins=user.get("wins", []),
         interests=user.get("interests", []),
