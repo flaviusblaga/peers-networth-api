@@ -3134,17 +3134,38 @@ def get_reports_admin(status: Optional[str] = None, admin_user: dict = Depends(g
     reports = list(db.reports.find(query).sort("created_at", -1).limit(200))
     return [ReportResponse(**report) for report in reports]
 
+class ReportAction(BaseModel):
+    action: str                     # "delete" (remove post + notify author) | "dismiss" (keep post + notify reporter)
+    message: Optional[str] = ""     # reason to the author (delete) / explanation to the reporter (dismiss)
+
 @api_router.put("/admin/reports/{report_id}")
-def update_report_admin(report_id: str, status: str, admin_user: dict = Depends(get_admin_user)):
+def resolve_report(report_id: str, data: ReportAction, admin_user: dict = Depends(get_admin_user)):
     report = db.reports.find_one({"id": report_id})
     if not report:
         raise HTTPException(status_code=404, detail="Report not found")
-    
-    if status not in ["pending", "resolved", "dismissed"]:
-        raise HTTPException(status_code=400, detail="Invalid status")
-    
-    db.reports.update_one({"id": report_id}, {"$set": {"status": status}})
-    return {"message": "Report updated successfully"}
+    msg = (data.message or "").strip()
+
+    if data.action == "delete":
+        pid = report.get("reported_post_id")
+        post = db.posts.find_one({"id": pid}) if pid else None
+        if post:
+            db.posts.delete_one({"id": pid})
+            _notice(post["user_id"], post.get("user_name", ""), admin_user,
+                    "⚠️ Postarea ta a fost eliminată de un moderator." + (f" Motiv: {msg}" if msg else ""))
+            _mod_log(admin_user, "delete_post", "post", pid, post.get("user_name", ""), msg or "în urma unei sesizări")
+        db.reports.update_one({"id": report_id}, {"$set": {"status": "resolved"}})
+        _mod_log(admin_user, "report_resolved", "report", report_id, report.get("reporter_name", ""), msg)
+        return {"message": "resolved", "post_deleted": bool(post)}
+
+    elif data.action == "dismiss":
+        if msg and report.get("reporter_id"):
+            _notice(report["reporter_id"], report.get("reporter_name", ""), admin_user,
+                    "Despre sesizarea ta — postarea rămâne publicată. " + msg)
+        db.reports.update_one({"id": report_id}, {"$set": {"status": "dismissed"}})
+        _mod_log(admin_user, "report_dismissed", "report", report_id, report.get("reporter_name", ""), msg)
+        return {"message": "dismissed"}
+
+    raise HTTPException(status_code=400, detail="Invalid action")
 
 # ==================== MODERATION ====================
 class WarnCreate(BaseModel):
