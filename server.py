@@ -158,10 +158,11 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 CLAUDE_FAST = "claude-haiku-5-5"      # cheap/fast: text + image moderation
 CLAUDE_SMART = "claude-sonnet-5-5"    # stronger: concierge "ask"
 
-def _claude(messages, system=None, model=CLAUDE_FAST, max_tokens=400, effort=None, disable_thinking=False):
-    """Call the Claude Messages API via urllib (no SDK dep). Returns text or None on failure/no key."""
+def _claude(messages, system=None, model=CLAUDE_FAST, max_tokens=400, effort=None, disable_thinking=False, want_usage=False):
+    """Call the Claude Messages API via urllib (no SDK dep).
+    Returns text (or None on failure/no key); if want_usage, returns (text, usage_dict)."""
     if not ANTHROPIC_API_KEY:
-        return None
+        return (None, {}) if want_usage else None
     body = {"model": model, "max_tokens": max_tokens, "messages": messages}
     if system:
         body["system"] = system
@@ -179,13 +180,43 @@ def _claude(messages, system=None, model=CLAUDE_FAST, max_tokens=400, effort=Non
         )
         resp = urllib.request.urlopen(req, timeout=25)
         data = _json.loads(resp.read().decode())
+        text = ""
         for block in (data.get("content") or []):
             if block.get("type") == "text":
-                return (block.get("text") or "").strip()
-        return ""
+                text = (block.get("text") or "").strip()
+                break
+        return (text, data.get("usage") or {}) if want_usage else text
     except Exception as e:
         logger.warning("Claude call failed: %s", e)
-        return None
+        return (None, {}) if want_usage else None
+
+# Per-member monthly AI budget (concierge "ask") — a membership perk.
+AI_BUDGET_ONLINE_CENTS = 500    # $5/month for Online members
+AI_BUDGET_CLUB_CENTS = 1500     # $15/month for Club members
+# $ per 1M tokens for the ask model (Sonnet 5.5): $2 in / $10 out
+_SONNET_IN_PER_M, _SONNET_OUT_PER_M = 2.0, 10.0
+
+def _ai_allowance_cents(user: dict) -> int:
+    if user.get("is_admin") or user.get("email") in ADMIN_EMAILS:
+        return 100000  # effectively unlimited for admins
+    return AI_BUDGET_CLUB_CENTS if user.get("membership_tier") == "club" else AI_BUDGET_ONLINE_CENTS
+
+def _ai_budget(user: dict):
+    """Returns (month, used_cents, allowance_cents). Resets on a new calendar month."""
+    month = datetime.utcnow().strftime("%Y-%m")
+    b = user.get("ai_budget") or {}
+    used = int(b.get("used_cents", 0)) if b.get("month") == month else 0
+    return month, used, _ai_allowance_cents(user)
+
+def _ai_charge(user_id: str, month: str, prev_used: int, usage: dict) -> int:
+    """Compute cost of a Sonnet call in cents, add to the member's monthly usage. Returns new used_cents."""
+    it = int(usage.get("input_tokens", 0)) + int(usage.get("cache_read_input_tokens", 0)) + int(usage.get("cache_creation_input_tokens", 0))
+    ot = int(usage.get("output_tokens", 0))
+    cost = (it / 1_000_000.0) * _SONNET_IN_PER_M + (ot / 1_000_000.0) * _SONNET_OUT_PER_M
+    cents = max(1, int(round(cost * 100)))
+    new_used = prev_used + cents
+    db.users.update_one({"id": user_id}, {"$set": {"ai_budget": {"month": month, "used_cents": new_used}}})
+    return new_used
 
 # Hard block list (RO + EN) — explicit sexual terms + slurs. Instant, free, no AI needed.
 _BAD_WORDS = {
@@ -3642,6 +3673,10 @@ def concierge_ask(data: AskBody, current_user: dict = Depends(get_current_user))
     if not ANTHROPIC_API_KEY:
         return {"answer": None, "disabled": True, "people": []}
     uid = current_user["id"]
+    _month, _used, _allow = _ai_budget(current_user)
+    if _used >= _allow:
+        return {"answer": None, "people": [], "budget_exceeded": True,
+                "remaining_cents": 0, "allowance_cents": _allow}
     name_map = {t["id"]: t["name"] for t in db.topics.find({}, {"id": 1, "name": 1, "_id": 0})}
     def nm(slugs):
         return [name_map.get(s, s.replace("-", " ")) for s in (slugs or [])][:5]
@@ -3663,9 +3698,11 @@ def concierge_ask(data: AskBody, current_user: dict = Depends(get_current_user))
         "At the very end, on its own line, output 'PEOPLE: <comma-separated member indices>' (up to 3 best fits), or 'PEOPLE:' if none fit."
     )
     user = f"Member question: {q}\n\nMembers directory:\n{directory}"
-    out = _claude([{"role": "user", "content": user}], system=system, model=CLAUDE_SMART, max_tokens=500, effort="low")
+    out, usage = _claude([{"role": "user", "content": user}], system=system, model=CLAUDE_SMART,
+                         max_tokens=500, effort="low", want_usage=True)
     if not out:
         return {"answer": None, "disabled": True, "people": []}
+    new_used = _ai_charge(uid, _month, _used, usage)
     import re as _re3
     answer = out
     people = []
@@ -3677,7 +3714,14 @@ def concierge_ask(data: AskBody, current_user: dict = Depends(get_current_user))
             if tok.isdigit() and int(tok) < len(cands):
                 c = cands[int(tok)]
                 people.append({"id": c["id"], "name": c.get("name", ""), "headline": c.get("headline", ""), "avatar": c.get("avatar")})
-    return {"answer": answer, "people": people}
+    return {"answer": answer, "people": people,
+            "remaining_cents": max(0, _allow - new_used), "allowance_cents": _allow}
+
+@api_router.get("/concierge/budget")
+def concierge_budget(current_user: dict = Depends(get_current_user)):
+    month, used, allow = _ai_budget(current_user)
+    return {"month": month, "used_cents": used, "allowance_cents": allow,
+            "remaining_cents": max(0, allow - used), "ai_enabled": bool(ANTHROPIC_API_KEY)}
 
 class ConciergeFeedback(BaseModel):
     topics: List[str] = []
