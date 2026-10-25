@@ -3679,6 +3679,24 @@ def concierge_ask(data: AskBody, current_user: dict = Depends(get_current_user))
                 people.append({"id": c["id"], "name": c.get("name", ""), "headline": c.get("headline", ""), "avatar": c.get("avatar")})
     return {"answer": answer, "people": people}
 
+class ConciergeFeedback(BaseModel):
+    topics: List[str] = []
+    up: bool = True
+
+@api_router.post("/concierge/feedback")
+def concierge_feedback(data: ConciergeFeedback, current_user: dict = Depends(get_current_user)):
+    """Thumbs up/down on a concierge item refines the member's interest weights."""
+    slugs = [s for s in ([_slugify(x) for x in (data.topics or [])]) if s][:5]
+    if not slugs:
+        return {"ok": True}
+    delta = 0.5 if data.up else -0.5
+    u = db.users.find_one({"id": current_user["id"]}, {"interest_weights": 1, "_id": 0})
+    w = (u or {}).get("interest_weights", {}) or {}
+    for s in slugs:
+        w[s] = max(0.0, min(5.0, float(w.get(s, 0.0)) + delta))
+    db.users.update_one({"id": current_user["id"]}, {"$set": {"interest_weights": w}})
+    return {"ok": True}
+
 @api_router.get("/home/for-you")
 def home_for_you(current_user: dict = Depends(get_current_user)):
     """Personalized bundles for the Home rail: people to meet + topics to follow."""
