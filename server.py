@@ -196,10 +196,22 @@ AI_BUDGET_CLUB_CENTS = 1500     # $15/month for Club members
 # $ per 1M tokens for the ask model (Sonnet 5.5): $2 in / $10 out
 _SONNET_IN_PER_M, _SONNET_OUT_PER_M = 2.0, 10.0
 
+def _ai_budgets_cfg() -> dict:
+    """Current per-tier monthly allowances (cents), editable from admin, fallback to defaults."""
+    s = db.settings.find_one({"id": "ai_budget"}) or {}
+    return {
+        "online_cents": int(s.get("online_cents", AI_BUDGET_ONLINE_CENTS)),
+        "club_cents": int(s.get("club_cents", AI_BUDGET_CLUB_CENTS)),
+    }
+
+def _is_admin_user(user: dict) -> bool:
+    return bool(user.get("is_admin") or user.get("email") in ADMIN_EMAILS)
+
 def _ai_allowance_cents(user: dict) -> int:
-    if user.get("is_admin") or user.get("email") in ADMIN_EMAILS:
-        return 100000  # effectively unlimited for admins
-    return AI_BUDGET_CLUB_CENTS if user.get("membership_tier") == "club" else AI_BUDGET_ONLINE_CENTS
+    if _is_admin_user(user):
+        return 10_000_000  # admins are unlimited (flagged separately in responses)
+    cfg = _ai_budgets_cfg()
+    return cfg["club_cents"] if user.get("membership_tier") == "club" else cfg["online_cents"]
 
 def _ai_budget(user: dict):
     """Returns (month, used_cents, allowance_cents). Resets on a new calendar month."""
@@ -3721,7 +3733,26 @@ def concierge_ask(data: AskBody, current_user: dict = Depends(get_current_user))
 def concierge_budget(current_user: dict = Depends(get_current_user)):
     month, used, allow = _ai_budget(current_user)
     return {"month": month, "used_cents": used, "allowance_cents": allow,
-            "remaining_cents": max(0, allow - used), "ai_enabled": bool(ANTHROPIC_API_KEY)}
+            "remaining_cents": max(0, allow - used), "ai_enabled": bool(ANTHROPIC_API_KEY),
+            "unlimited": _is_admin_user(current_user)}
+
+class AiBudgetUpdate(BaseModel):
+    online_usd: float
+    club_usd: float
+
+@api_router.get("/admin/ai-budget")
+def admin_get_ai_budget(admin_user: dict = Depends(get_admin_user)):
+    cfg = _ai_budgets_cfg()
+    return {"online_usd": cfg["online_cents"] / 100.0, "club_usd": cfg["club_cents"] / 100.0}
+
+@api_router.put("/admin/ai-budget")
+def admin_set_ai_budget(data: AiBudgetUpdate, admin_user: dict = Depends(get_admin_user)):
+    online_cents = max(0, int(round((data.online_usd or 0) * 100)))
+    club_cents = max(0, int(round((data.club_usd or 0) * 100)))
+    db.settings.update_one({"id": "ai_budget"},
+                           {"$set": {"id": "ai_budget", "online_cents": online_cents, "club_cents": club_cents}},
+                           upsert=True)
+    return {"online_usd": online_cents / 100.0, "club_usd": club_cents / 100.0}
 
 class ConciergeFeedback(BaseModel):
     topics: List[str] = []
