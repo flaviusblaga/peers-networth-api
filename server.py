@@ -446,6 +446,7 @@ class UserResponse(UserBase):
     badge: str = ""   # "" | "founder" | "cofounder" | "sbe"
     suspended_until: Optional[datetime] = None  # moderator temporary suspension (populated only in admin/me)
     warnings: List[dict] = []  # moderator warnings (populated only in admin/me)
+    rel: Optional[str] = None  # relation to current viewer in /users list: "pending_out" | "pending_in" | "connected"
 
 class TokenResponse(BaseModel):
     access_token: str
@@ -1747,11 +1748,28 @@ def get_users(search: Optional[str] = None, current_user: dict = Depends(get_cur
         ]
     
     users = list(db.users.find(query).limit(100))
+
+    # Relationship of the viewer to each listed user, so the UI shows the right state
+    # (and so already-connected people drop out of discover into Connections).
+    rel_map: dict = {}
+    me = current_user["id"]
+    for c in db.connections.find({"$or": [{"from_user_id": me}, {"to_user_id": me}]}):
+        other = c["to_user_id"] if c["from_user_id"] == me else c["from_user_id"]
+        st = c.get("status")
+        if st == "accepted":
+            rel_map[other] = "connected"
+        elif st == "pending" and other not in rel_map:
+            rel_map[other] = "pending_out" if c["from_user_id"] == me else "pending_in"
+
     result = []
     for user in users:
+        rel = rel_map.get(user["id"])
+        if rel == "connected":
+            continue  # already connected -> shown only in the Connections tab
         connections_count = get_connections_count(user["id"])
         is_admin = user.get("is_admin", False) or user.get("email") in ADMIN_EMAILS
         result.append(UserResponse(
+            rel=rel,
             id=user["id"],
             email=user["email"],
             name=user["name"],
