@@ -128,12 +128,20 @@ MEMBERS_EMAIL = os.environ.get('MEMBERS_EMAIL', FROM_EMAIL)
 ADMIN_NOTIFY_EMAIL = os.environ.get('ADMIN_NOTIFY_EMAIL', '')
 APP_URL = 'https://peers.networth.ro'
 
-def _send_email(to: str, subject: str, html: str, from_email: str = None) -> bool:
-    """Send email via Resend API. Silently skips if RESEND_API_KEY is not set."""
+def _send_email(to: str, subject: str, html: str, from_email: str = None, attachments: list = None) -> bool:
+    """Send email via Resend API. Silently skips if RESEND_API_KEY is not set.
+    attachments: optional list of {"filename", "content" (bytes or str), "content_type"}."""
     if not RESEND_API_KEY or not to:
         return False
     try:
-        data = _json.dumps({"from": from_email or FROM_EMAIL, "to": [to], "subject": subject, "html": html}).encode()
+        payload = {"from": from_email or FROM_EMAIL, "to": [to], "subject": subject, "html": html}
+        if attachments:
+            payload["attachments"] = [{
+                "filename": a["filename"],
+                "content": base64.b64encode(a["content"].encode() if isinstance(a["content"], str) else a["content"]).decode(),
+                "content_type": a.get("content_type", "application/octet-stream"),
+            } for a in attachments]
+        data = _json.dumps(payload).encode()
         req = urllib.request.Request(
             "https://api.resend.com/emails",
             data=data,
@@ -1544,6 +1552,57 @@ def delete_application(app_id: str, admin_user: dict = Depends(get_admin_user)):
 
 
 # ==================== OFFICE HOURS / 1:1 BOOKING ====================
+def _ics_escape(s: str) -> str:
+    return (s or "").replace("\\", "\\\\").replace(";", "\\;").replace(",", "\\,").replace("\n", "\\n")
+
+def _build_invite_ics(slot: dict, organizer_email: str, organizer_name: str,
+                      attendee_email: str, attendee_name: str) -> str:
+    """Build a METHOD:REQUEST VEVENT. Times are floating local (no TZ), matching the
+    naive 'YYYY-MM-DD HH:MM' start the host entered — Gmail/Outlook offer 'Add to calendar'."""
+    import re as _re2
+    m = _re2.match(r"(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})", slot.get("start", ""))
+    if not m:
+        return ""
+    y, mo, d, h, mi = (int(x) for x in m.groups())
+    start = datetime(y, mo, d, h, mi)
+    end = start + timedelta(minutes=int(slot.get("duration_min") or 30))
+    fmt = lambda dt: dt.strftime("%Y%m%dT%H%M%S")
+    now = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    summary = _ics_escape("Peers 1:1 — " + (slot.get("topic") or organizer_name))
+    desc = _ics_escape(f"Peers Office Hours · {organizer_name} & {attendee_name}")
+    lines = [
+        "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Peers//NetWorth//EN",
+        "CALSCALE:GREGORIAN", "METHOD:REQUEST", "BEGIN:VEVENT",
+        f"UID:{slot.get('id')}@peers.networth.ro",
+        f"DTSTAMP:{now}", f"DTSTART:{fmt(start)}", f"DTEND:{fmt(end)}",
+        f"SUMMARY:{summary}", f"DESCRIPTION:{desc}",
+        f"ORGANIZER;CN={_ics_escape(organizer_name)}:mailto:{organizer_email}",
+        f"ATTENDEE;CN={_ics_escape(attendee_name)};RSVP=TRUE:mailto:{attendee_email}",
+        "STATUS:CONFIRMED", "SEQUENCE:0", "END:VEVENT", "END:VCALENDAR",
+    ]
+    return "\r\n".join(lines)
+
+def _send_slot_invites(slot: dict, host: dict, booker: dict):
+    """Email a calendar invite (.ics) to both the host and the booker."""
+    if not host or not booker:
+        return
+    ics = _build_invite_ics(slot, host.get("email", ""), host.get("name", "Host"),
+                            booker.get("email", ""), booker.get("name", "Member"))
+    if not ics:
+        return
+    att = [{"filename": "peers-1-1.ics", "content": ics, "content_type": "text/calendar; method=REQUEST; charset=utf-8"}]
+    when = f"{slot.get('start','')} · {slot.get('duration_min',30)} min"
+    topic = f"<br>Topic: {html.escape(slot.get('topic') or '—')}" if slot.get("topic") else ""
+    for person, other in ((host, booker), (booker, host)):
+        if not person.get("email"):
+            continue
+        body = (f"<p>Hi {html.escape(person.get('name',''))},</p>"
+                f"<p>Your Peers 1:1 with <b>{html.escape(other.get('name',''))}</b> is confirmed.</p>"
+                f"<p><b>{html.escape(when)}</b>{topic}</p>"
+                f"<p>The calendar invite is attached — open it to add this to Google Calendar or Outlook.</p>"
+                f"<p style='color:#888;font-size:12px'>Peers by netWORTH · powered by SuperBrain</p>")
+        _send_email(person["email"], f"Peers 1:1 · {when}", body, attachments=att)
+
 class SlotCreate(BaseModel):
     start: str           # "YYYY-MM-DD HH:MM"
     duration_min: Optional[int] = 30
@@ -1589,6 +1648,11 @@ def book_slot(slot_id: str, current_user: dict = Depends(get_club_user)):
         f"Ți-am rezervat slotul de {s['duration_min']} min din {s['start']}. {s.get('topic','')}".strip())
     _dm(s["host_id"], s["host_name"], current_user["id"], current_user["name"],
         f"Rezervare confirmată: {s['start']} ({s['duration_min']} min). Ne auzim atunci.")
+    try:
+        host = db.users.find_one({"id": s["host_id"]}, {"_id": 0, "email": 1, "name": 1})
+        _send_slot_invites(s, host, current_user)
+    except Exception as e:
+        logger.warning("Slot invite email failed: %s", e)
     return {"message": "booked"}
 
 @api_router.delete("/slots/{slot_id}")
