@@ -1603,6 +1603,20 @@ def _send_slot_invites(slot: dict, host: dict, booker: dict):
                 f"<p style='color:#888;font-size:12px'>Peers by netWORTH · powered by SuperBrain</p>")
         _send_email(person["email"], f"Peers 1:1 · {when}", body, attachments=att)
 
+def _is_en(lang) -> bool:
+    return (lang or "en").lower().startswith("en")
+
+def _dm_booked_to_host(lang, dur, start, topic) -> str:
+    topic = (topic or "").strip()
+    if _is_en(lang):
+        return (f"I booked your {dur} min slot on {start}." + (f" {topic}" if topic else "")).strip()
+    return (f"Ți-am rezervat slotul de {dur} min din {start}." + (f" {topic}" if topic else "")).strip()
+
+def _dm_confirmed_to_booker(lang, start, dur) -> str:
+    if _is_en(lang):
+        return f"Booking confirmed: {start} ({dur} min). Talk to you then."
+    return f"Rezervare confirmată: {start} ({dur} min). Ne auzim atunci."
+
 class SlotCreate(BaseModel):
     start: str           # "YYYY-MM-DD HH:MM"
     duration_min: Optional[int] = 30
@@ -1644,12 +1658,13 @@ def book_slot(slot_id: str, current_user: dict = Depends(get_club_user)):
     if s["host_id"] == current_user["id"]:
         raise HTTPException(status_code=400, detail="Can't book your own slot")
     db.slots.update_one({"id": slot_id}, {"$set": {"status": "booked", "booked_by_id": current_user["id"], "booked_by_name": current_user["name"]}})
+    host = db.users.find_one({"id": s["host_id"]}, {"_id": 0, "email": 1, "name": 1, "language": 1}) or {}
+    # DMs are delivered to each recipient in their own profile language.
     _dm(current_user["id"], current_user["name"], s["host_id"], s["host_name"],
-        f"Ți-am rezervat slotul de {s['duration_min']} min din {s['start']}. {s.get('topic','')}".strip())
+        _dm_booked_to_host(host.get("language"), s["duration_min"], s["start"], s.get("topic", "")))
     _dm(s["host_id"], s["host_name"], current_user["id"], current_user["name"],
-        f"Rezervare confirmată: {s['start']} ({s['duration_min']} min). Ne auzim atunci.")
+        _dm_confirmed_to_booker(current_user.get("language"), s["start"], s["duration_min"]))
     try:
-        host = db.users.find_one({"id": s["host_id"]}, {"_id": 0, "email": 1, "name": 1})
         _send_slot_invites(s, host, current_user)
     except Exception as e:
         logger.warning("Slot invite email failed: %s", e)
