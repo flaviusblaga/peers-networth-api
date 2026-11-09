@@ -471,6 +471,10 @@ class PostCreate(BaseModel):
     category: Optional[str] = None  # e.g. "cariera", "investitii", "business", "dilema", "general"
     tags: Optional[List[str]] = None  # free-form hashtags
     topics: Optional[List[str]] = None  # channel topic slugs (up to 3)
+    poll_options: Optional[List[str]] = None  # 2..10 fixed options -> turns the post into a poll
+
+class PollVote(BaseModel):
+    option_id: str
 
 class PostUpdate(BaseModel):
     content: Optional[str] = None
@@ -500,6 +504,7 @@ class PostResponse(BaseModel):
     pinned: Optional[bool] = False  # moderator-pinned to top of feed
     bookmarked: Optional[bool] = False  # set when a user's bookmarks are returned
     reported: Optional[bool] = False  # set when the current user has reported this post
+    poll: Optional[dict] = None  # {options:[{id,text,votes}], total_votes, my_vote} when the post is a poll
 
 class BookmarkResponse(BaseModel):
     id: str
@@ -1827,7 +1832,17 @@ def get_users(search: Optional[str] = None, current_user: dict = Depends(get_cur
             {"can_help_with": {"$elemMatch": {"$regex": search, "$options": "i"}}}
         ]
     
-    users = list(db.users.find(query).limit(100))
+    # Null out legacy base64 avatars SERVER-SIDE so Atlas never ships them (one is
+    # 3MB; the whole list was ~4.3MB, which tripped the worker timeout -> 503 ->
+    # browser "Network Error"). Real http(s) avatar URLs pass through unchanged.
+    users = list(db.users.aggregate([
+        {"$match": query},
+        {"$limit": 100},
+        {"$addFields": {"avatar": {"$cond": [
+            {"$regexMatch": {"input": {"$ifNull": ["$avatar", ""]}, "regex": "^https?://"}},
+            "$avatar", None
+        ]}}},
+    ]))
 
     # Relationship of the viewer to each listed user, so the UI shows the right state
     # (and so already-connected people drop out of discover into Connections).
@@ -1979,6 +1994,21 @@ def create_post(post_data: PostCreate, current_user: dict = Depends(get_current_
     # Accept up to 3 images; fall back to the legacy single `image` field.
     raw_imgs = post_data.images if post_data.images else ([post_data.image] if post_data.image else [])
     stored_imgs = [img for img in (_store_image(x, "posts") for x in raw_imgs[:3] if x) if img]
+    # Poll: 2..10 distinct non-empty options turn the post into a vote. Votes are a
+    # map {user_id: option_id}, so each member counts once and can change their vote.
+    poll = None
+    if post_data.poll_options:
+        opts_clean, seen = [], set()
+        for o in post_data.poll_options:
+            tx = (o or "").strip()
+            key = tx.lower()
+            if tx and key not in seen:
+                seen.add(key)
+                opts_clean.append(tx)
+            if len(opts_clean) >= 10:
+                break
+        if len(opts_clean) >= 2:
+            poll = {"options": [{"id": str(uuid.uuid4())[:8], "text": tx} for tx in opts_clean], "votes": {}}
     post_dict = {
         "id": post_id,
         "user_id": current_user["id"],
@@ -1992,15 +2022,16 @@ def create_post(post_data: PostCreate, current_user: dict = Depends(get_current_
         "category": post_data.category,
         "tags": post_data.tags or [],
         "topics": [_slugify(x) for x in (post_data.topics or [])][:3],
+        "poll": poll,
         "likes": [],
         "comments": [],
         "created_at": datetime.utcnow()
     }
     db.posts.insert_one(post_dict)
-    return _enrich_post(post_dict)
+    return _enrich_post(post_dict, current_user["id"])
 
 
-def _enrich_post(post: dict) -> PostResponse:
+def _enrich_post(post: dict, viewer_id: Optional[str] = None) -> PostResponse:
     """Attach current user avatar (and comment authors' avatars) fetched from users collection."""
     # Legacy posts stored only `image`; expose a unified `images` list.
     if not post.get("images") and post.get("image"):
@@ -2036,6 +2067,21 @@ def _enrich_post(post: dict) -> PostResponse:
                 c["user_avatar"] = a.get("avatar")
                 if a.get("name"):
                     c["user_name"] = a["name"]
+
+    # Poll: expose per-option counts + whether the viewer already voted.
+    poll = post.get("poll")
+    if isinstance(poll, dict) and poll.get("options"):
+        votes = poll.get("votes", {}) or {}
+        counts: dict = {}
+        for _uid, oid in votes.items():
+            counts[oid] = counts.get(oid, 0) + 1
+        post["poll"] = {
+            "options": [{"id": o["id"], "text": o["text"], "votes": counts.get(o["id"], 0)} for o in poll["options"]],
+            "total_votes": len(votes),
+            "my_vote": votes.get(viewer_id) if viewer_id else None,
+        }
+    else:
+        post["poll"] = None
     return PostResponse(**post)
 
 
@@ -2070,7 +2116,7 @@ def get_posts(current_user: dict = Depends(get_current_user)):
     for _p in posts:
         _p["bookmarked"] = _p.get("id") in _bm
         _p["reported"] = _p.get("id") in _rp
-    return [_enrich_post(post) for post in posts]
+    return [_enrich_post(post, current_user["id"]) for post in posts]
 
 @api_router.get("/posts/all", response_model=List[PostResponse])
 def get_all_posts(current_user: dict = Depends(get_current_user)):
@@ -2080,7 +2126,7 @@ def get_all_posts(current_user: dict = Depends(get_current_user)):
     for _p in posts:
         _p["bookmarked"] = _p.get("id") in _bm
         _p["reported"] = _p.get("id") in _rp
-    return [_enrich_post(post) for post in posts]
+    return [_enrich_post(post, current_user["id"]) for post in posts]
 
 @api_router.get("/posts/user/{user_id}", response_model=List[PostResponse])
 def get_user_posts(user_id: str, current_user: dict = Depends(get_current_user)):
@@ -2090,7 +2136,7 @@ def get_user_posts(user_id: str, current_user: dict = Depends(get_current_user))
     for _p in posts:
         _p["bookmarked"] = _p.get("id") in _bm
         _p["reported"] = _p.get("id") in _rp
-    return [_enrich_post(post) for post in posts]
+    return [_enrich_post(post, current_user["id"]) for post in posts]
 
 @api_router.post("/posts/{post_id}/like")
 def like_post(post_id: str, current_user: dict = Depends(get_current_user)):
@@ -2106,6 +2152,21 @@ def like_post(post_id: str, current_user: dict = Depends(get_current_user)):
         # Like
         db.posts.update_one({"id": post_id}, {"$push": {"likes": current_user["id"]}})
         return {"message": "Liked", "liked": True}
+
+@api_router.post("/posts/{post_id}/vote", response_model=PostResponse)
+def vote_poll(post_id: str, data: PollVote, current_user: dict = Depends(get_current_user)):
+    _assert_can_write(current_user)
+    post = db.posts.find_one({"id": post_id})
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    poll = post.get("poll")
+    if not isinstance(poll, dict) or not poll.get("options"):
+        raise HTTPException(status_code=400, detail="This post has no poll")
+    if data.option_id not in {o["id"] for o in poll["options"]}:
+        raise HTTPException(status_code=400, detail="Invalid option")
+    # One vote per member; re-voting replaces the previous choice.
+    db.posts.update_one({"id": post_id}, {"$set": {f"poll.votes.{current_user['id']}": data.option_id}})
+    return _enrich_post(db.posts.find_one({"id": post_id}), current_user["id"])
 
 @api_router.post("/posts/{post_id}/comment", response_model=PostResponse)
 def add_comment(post_id: str, comment_data: CommentCreate, current_user: dict = Depends(get_current_user)):
@@ -2127,7 +2188,7 @@ def add_comment(post_id: str, comment_data: CommentCreate, current_user: dict = 
     
     db.posts.update_one({"id": post_id}, {"$push": {"comments": comment}})
     updated_post = db.posts.find_one({"id": post_id})
-    return _enrich_post(updated_post)
+    return _enrich_post(updated_post, current_user["id"])
 
 @api_router.put("/posts/{post_id}/comments/{comment_id}", response_model=PostResponse)
 def update_comment(post_id: str, comment_id: str, comment_data: CommentUpdate, current_user: dict = Depends(get_current_user)):
@@ -2151,7 +2212,7 @@ def update_comment(post_id: str, comment_id: str, comment_data: CommentUpdate, c
     )
 
     updated_post = db.posts.find_one({"id": post_id})
-    return _enrich_post(updated_post)
+    return _enrich_post(updated_post, current_user["id"])
 
 @api_router.put("/posts/{post_id}", response_model=PostResponse)
 def update_post(post_id: str, post_data: PostUpdate, current_user: dict = Depends(get_current_user)):
@@ -2174,7 +2235,7 @@ def update_post(post_id: str, post_data: PostUpdate, current_user: dict = Depend
         db.posts.update_one({"id": post_id}, {"$set": update_dict})
 
     updated_post = db.posts.find_one({"id": post_id})
-    return _enrich_post(updated_post)
+    return _enrich_post(updated_post, current_user["id"])
 
 @api_router.delete("/posts/{post_id}")
 def delete_post(post_id: str, current_user: dict = Depends(get_current_user)):
@@ -2206,7 +2267,7 @@ def delete_comment(post_id: str, comment_id: str, current_user: dict = Depends(g
     if mod and comment.get("user_id") != current_user["id"]:
         _mod_log(current_user, "delete_comment", "comment", comment_id,
                  comment.get("user_name", ""), (comment.get("content") or "")[:140])
-    return _enrich_post(db.posts.find_one({"id": post_id}))
+    return _enrich_post(db.posts.find_one({"id": post_id}), current_user["id"])
 
 @api_router.put("/posts/{post_id}/pin", response_model=PostResponse)
 def pin_post(post_id: str, current_user: dict = Depends(get_moderator_user)):
@@ -2217,7 +2278,7 @@ def pin_post(post_id: str, current_user: dict = Depends(get_moderator_user)):
     db.posts.update_one({"id": post_id}, {"$set": {"pinned": pinned}})
     _mod_log(current_user, "pin_post" if pinned else "unpin_post", "post", post_id,
              post.get("user_name", ""), (post.get("content") or "")[:140])
-    return _enrich_post(db.posts.find_one({"id": post_id}))
+    return _enrich_post(db.posts.find_one({"id": post_id}), current_user["id"])
 
 # ==================== BOOKMARK ROUTES ====================
 
@@ -2247,7 +2308,7 @@ def get_bookmarks(current_user: dict = Depends(get_current_user)):
     ordered = [posts_by_id[pid] for pid in post_ids if pid in posts_by_id]
     for p in ordered:
         p["bookmarked"] = True
-    return [_enrich_post(p) for p in ordered]
+    return [_enrich_post(p, current_user["id"]) for p in ordered]
 
 # ==================== CONNECTION ROUTES ====================
 
@@ -3518,7 +3579,7 @@ def get_channel(slug: str, current_user: dict = Depends(get_current_user)):
     for _p in posts:
         _p["bookmarked"] = _p.get("id") in _bm
         _p["reported"] = _p.get("id") in _rp
-    return {"topic": _topic_out(t, uid), "posts": [_enrich_post(p) for p in posts]}
+    return {"topic": _topic_out(t, uid), "posts": [_enrich_post(p, uid) for p in posts]}
 
 @api_router.post("/admin/topics/seed")
 def admin_seed_topics(admin_user: dict = Depends(get_admin_user)):
