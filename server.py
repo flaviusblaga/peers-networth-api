@@ -3949,6 +3949,154 @@ def home_for_you(current_user: dict = Depends(get_current_user)):
                     "count": len(t.get("interested_users", []) or [])} for t in topics[:6]]
     return {"people": people, "topics": sugg_topics}
 
+# ==================== INTRODUCE (share a contact to another contact) ====================
+class IntroduceCreate(BaseModel):
+    contact_id: str                   # the connection I want to introduce
+    to_id: str                        # the connection who should meet them
+    note: Optional[str] = ""          # optional personal note
+
+@api_router.post("/introduce")
+def introduce_contacts(data: IntroduceCreate, current_user: dict = Depends(get_club_user)):
+    """Proactively introduce two of my contacts to each other.
+    DMs both of them the other's profile + my note. (Different from /intros, which is a pull request.)"""
+    _assert_can_write(current_user)
+    uid = current_user["id"]
+    a_id, b_id = data.contact_id, data.to_id
+    if a_id == b_id:
+        raise HTTPException(status_code=400, detail="Pick two different contacts")
+    if uid in (a_id, b_id):
+        raise HTTPException(status_code=400, detail="Invalid request")
+    conns = _accepted_conn_ids(uid)
+    if a_id not in conns or b_id not in conns:
+        raise HTTPException(status_code=403, detail="You can only introduce your own contacts")
+    a = db.users.find_one({"id": a_id}, {"_id": 0, "id": 1, "name": 1, "headline": 1, "language": 1})
+    b = db.users.find_one({"id": b_id}, {"_id": 0, "id": 1, "name": 1, "headline": 1, "language": 1})
+    if not a or not b:
+        raise HTTPException(status_code=404, detail="Contact not found")
+    note = (data.note or "").strip()[:500]
+    me = current_user["name"]
+
+    def _line(recipient, other):
+        en = _is_en(recipient.get("language"))
+        head = f" — {other['headline']}" if other.get("headline") else ""
+        link = f"{APP_URL}/u/{other['id']}"
+        if en:
+            s = f"🤝 {me} introduced you to {other['name']}{head}.\nProfile: {link}"
+            if note:
+                s += f"\n\n“{note}”"
+            return s
+        s = f"🤝 {me} te-a prezentat lui {other['name']}{head}.\nProfil: {link}"
+        if note:
+            s += f"\n\n„{note}”"
+        return s
+
+    _dm(uid, me, b_id, b["name"], _line(b, a))
+    _dm(uid, me, a_id, a["name"], _line(a, b))
+    return {"ok": True, "introduced": [a["name"], b["name"]]}
+
+# ==================== TEST SEED (admin only; emails @peers.test) ====================
+TEST_PERSONAS = [
+    ("Andrea Ionescu", "Head of Sales @ Coca-Cola HBC", "ro", "club"),
+    ("Ika Varga", "Marketing Director @ Hell Energy", "en", "club"),
+    ("Mihai Georgescu", "Founder & CEO @ TechVentures", "ro", "club"),
+    ("Ioana Marinescu", "CFO @ Banca Transilvania", "ro", "online"),
+    ("Elena Dumitru", "HR Director @ eMAG", "ro", "online"),
+    ("Radu Stan", "COO @ Profi", "ro", "online"),
+    ("Carmen Pop", "Product Lead @ UiPath", "en", "online"),
+    ("Alexandru Nistor", "Key Account Manager @ P&G", "ro", "online"),
+    ("Diana Florea", "Legal Counsel @ Enel", "ro", "online"),
+    ("Victor Alba", "Finance Manager @ OMV Petrom", "ro", "online"),
+]
+TEST_POSTS = [
+    "Cum structurați comisioanele pentru o echipă de KAM pe retail modern? Caut un model care premiază atât volumul cât și marja. #sales",
+    "We just rolled out a new trade-marketing calendar across 6 countries. Happy to share the template. #marketing",
+    "Am închis runda seed. Lecția nr. 1: vorbește cu 50 de clienți înainte să scrii o linie de cod. #startup",
+    "Întrebare pentru colegii din finanțe: cum gestionați cash-flow-ul în retail cu termene de plată de 90 de zile? #finance",
+    "Hiring thoughts: structured interviews beat gut feeling every time. Our false-positive rate dropped 40%. #hr",
+    "Optimizare operațională în logistică: am tăiat 12% din costul pe livrare doar reașezând rutele. #operations",
+]
+
+@api_router.post("/admin/seed-test-members")
+def seed_test_members(admin_user: dict = Depends(get_admin_user)):
+    """Create 10 test members (@peers.test) with roles, interests, posts; connect 3 to the admin.
+    Idempotent: wipes existing @peers.test data first. Guarded to admin."""
+    import random
+    rnd = random.Random(42)
+    me_id = admin_user["id"]
+
+    # --- wipe previous test data ---
+    old = list(db.users.find({"email": {"$regex": r"@peers\.test$"}}, {"id": 1, "_id": 0}))
+    old_ids = [u["id"] for u in old]
+    if old_ids:
+        db.posts.delete_many({"user_id": {"$in": old_ids}})
+        db.connections.delete_many({"$or": [{"from_user_id": {"$in": old_ids}}, {"to_user_id": {"$in": old_ids}}]})
+        db.messages.delete_many({"$or": [{"from_user_id": {"$in": old_ids}}, {"to_user_id": {"$in": old_ids}}]})
+        db.users.delete_many({"id": {"$in": old_ids}})
+
+    all_topics = [t["id"] for t in db.topics.find({"status": "approved"}, {"id": 1, "_id": 0}).limit(300)]
+    mine = list(admin_user.get("interests", []) or [])
+    my_need = list(admin_user.get("looking_for", []) or [])
+    pw = get_password_hash("Test1234!")
+    now = datetime.utcnow()
+
+    created = []
+    for i, (name, headline, lang, tier) in enumerate(TEST_PERSONAS, start=1):
+        # interests: overlap with mine (guarantees for-you/week matches) + variety
+        interests = list(dict.fromkeys(
+            (rnd.sample(mine, min(3, len(mine))) if mine else [])
+            + (rnd.sample(all_topics, min(4, len(all_topics))) if all_topics else [])
+        ))
+        can_help = list(dict.fromkeys(
+            (rnd.sample(my_need, min(2, len(my_need))) if my_need else [])
+            + (rnd.sample(all_topics, min(2, len(all_topics))) if all_topics else [])
+        ))
+        looking = rnd.sample(all_topics, min(2, len(all_topics))) if all_topics else []
+        uid = str(uuid.uuid4())
+        db.users.insert_one({
+            "id": uid, "email": f"test{i}@peers.test", "name": name,
+            "password_hash": pw, "bio": f"Test member — {headline}.", "headline": headline,
+            "location": "București", "phone": "", "skills": [], "experience": [],
+            "language": lang, "is_admin": False, "is_blocked": False, "membership_tier": tier,
+            "badge": "", "can_help_with": can_help, "wins": [], "interests": interests,
+            "looking_for": looking, "goals": {}, "interest_weights": {}, "onboarded": True,
+            "invite_code": "", "invite_source": "test-seed", "created_at": now,
+        })
+        created.append({"id": uid, "name": name, "email": f"test{i}@peers.test"})
+        # follow some topics so counts grow
+        for tp in interests[:3]:
+            db.topics.update_one({"id": tp}, {"$addToSet": {"interested_users": uid}})
+
+    # --- posts (so "to read" populates); tag with topics that overlap mine ---
+    read_tags = (mine[:2] if mine else all_topics[:2])
+    for j, body in enumerate(TEST_POSTS):
+        author = created[j]
+        full = db.users.find_one({"id": author["id"]})
+        db.posts.insert_one({
+            "id": str(uuid.uuid4()), "user_id": author["id"], "user_name": author["name"],
+            "user_headline": full.get("headline", ""), "user_avatar": None,
+            "content": body, "images": [], "tags": [], "topics": read_tags,
+            "anonymous": False, "likes": [], "comments": [],
+            "created_at": now - timedelta(hours=j),
+        })
+
+    # --- connect the admin to the first 3 (accepted) so sharing contacts is testable ---
+    linked = []
+    for author in created[:3]:
+        full = db.users.find_one({"id": author["id"]})
+        db.connections.insert_one({
+            "id": str(uuid.uuid4()),
+            "from_user_id": me_id, "from_user_name": admin_user["name"], "from_user_headline": admin_user.get("headline", ""),
+            "to_user_id": author["id"], "to_user_name": author["name"], "to_user_headline": full.get("headline", ""),
+            "status": "accepted", "created_at": now,
+        })
+        linked.append(author["name"])
+
+    return {
+        "ok": True, "created": created, "connected_to_admin": linked,
+        "posts": len(TEST_POSTS), "your_interests": mine,
+        "note": "Set your interests in onboarding if 'your_interests' is empty — people matching needs them." if not mine else "",
+    }
+
 # Include the router
 app.include_router(api_router)
 
