@@ -1841,12 +1841,24 @@ def get_users(search: Optional[str] = None, current_user: dict = Depends(get_cur
         elif st == "pending" and other not in rel_map:
             rel_map[other] = "pending_out" if c["from_user_id"] == me else "pending_in"
 
+    # Accepted-connection counts for every listed user in ONE pass, instead of a
+    # count query per user (N+1 -> single scan). Only the listed users are tallied.
+    listed_ids = {u["id"] for u in users}
+    conn_counts: dict = {}
+    for c in db.connections.find({"status": "accepted"},
+                                 {"from_user_id": 1, "to_user_id": 1, "_id": 0}):
+        a, b = c.get("from_user_id"), c.get("to_user_id")
+        if a in listed_ids:
+            conn_counts[a] = conn_counts.get(a, 0) + 1
+        if b in listed_ids:
+            conn_counts[b] = conn_counts.get(b, 0) + 1
+
     result = []
     for user in users:
         rel = rel_map.get(user["id"])
         if rel == "connected":
             continue  # already connected -> shown only in the Connections tab
-        connections_count = get_connections_count(user["id"])
+        connections_count = conn_counts.get(user["id"], 0)
         is_admin = user.get("is_admin", False) or user.get("email") in ADMIN_EMAILS
         result.append(UserResponse(
             rel=rel,
