@@ -444,7 +444,12 @@ class UserUpdate(BaseModel):
 
 class UserResponse(UserBase):
     id: str
-    email: Optional[EmailStr] = None  # omitted on public profiles unless the viewer may see contact
+    # Plain str, NOT EmailStr: EmailStr re-runs an email-validator deliverability
+    # (DNS MX) lookup on every serialization. Listing users fired one lookup per
+    # member — the @peers.test accounts hang on Render's resolver — which timed out
+    # the worker and surfaced as a 503 / "Network Error" on Discover. The address is
+    # already validated at signup; never DNS-check it again just to return it.
+    email: Optional[str] = None  # omitted on public profiles unless the viewer may see contact
     created_at: datetime
     connections_count: int = 0
     avatar: Optional[str] = None
