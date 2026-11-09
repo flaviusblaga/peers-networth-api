@@ -1859,6 +1859,12 @@ def get_users(search: Optional[str] = None, current_user: dict = Depends(get_cur
         if rel == "connected":
             continue  # already connected -> shown only in the Connections tab
         connections_count = conn_counts.get(user["id"], 0)
+        # Keep the list response small: never ship legacy base64 avatars here (one can
+        # be several MB and make the whole Discover payload time out on mobile). The
+        # full image still loads on the individual profile endpoint. Real URLs pass through.
+        av = user.get("avatar")
+        if av and not av.startswith("http"):
+            av = None
         is_admin = user.get("is_admin", False) or user.get("email") in ADMIN_EMAILS
         result.append(UserResponse(
             rel=rel,
@@ -1875,7 +1881,7 @@ def get_users(search: Optional[str] = None, current_user: dict = Depends(get_cur
             language=user.get("language", "en"),
             created_at=user["created_at"],
             connections_count=connections_count,
-            avatar=user.get("avatar")
+            avatar=av
         ))
     return result
 
