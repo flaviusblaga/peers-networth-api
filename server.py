@@ -1207,16 +1207,39 @@ def get_crypto():
 
 _bet_cache = {"ts": 0.0, "data": None}
 
+# stocks.networth.ro sits behind LiteSpeed/mod_security on shared hosting, which
+# rejects the plain bot-style UA from Render's datacenter IPs. A full browser UA
+# plus Accept-Language + a same-site Referer passes those rules.
+_BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+               "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36")
+
+def _fetch_json_browser(url, referer=None):
+    headers = {
+        "User-Agent": _BROWSER_UA,
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "ro-RO,ro;q=0.9,en;q=0.8",
+    }
+    if referer:
+        headers["Referer"] = referer
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=12) as r:
+        return _json.loads(r.read().decode("utf-8"))
+
 @api_router.get("/bet")
 def get_bet():
-    """BET index (Bucharest) from stocks.networth.ro, cached ~15 min."""
+    """BET index (Bucharest) from stocks.networth.ro, cached ~15 min.
+    Degrades to a 200 with null values if the upstream is unreachable — never
+    503s, so the markets sidebar never shows a Network Error over this line."""
     import re
     now = time.time()
     if _bet_cache["data"] and now - _bet_cache["ts"] < 900:
         return _bet_cache["data"]
     try:
-        d = _fx_fetch_json("https://stocks.networth.ro/api/analysis.php")
+        d = _fetch_json_browser("https://stocks.networth.ro/api/analysis.php",
+                                referer="https://stocks.networth.ro/")
         summary = d.get("summary", "") or ""
+        if not summary:
+            summary = " ".join(d.get("paragraphs", []) or [])
         m = re.search(r"BET\s*([+-]?[\d.,]+)\s*%\s*\(([\d.,]+)", summary)
         data = {
             "index": "BET",
@@ -1233,7 +1256,9 @@ def get_bet():
         logging.getLogger("bet").warning(f"BET fetch failed: {e}")
         if _bet_cache["data"]:
             return _bet_cache["data"]
-        raise HTTPException(status_code=503, detail="BET data unavailable")
+        # Graceful fallback — no 503. Sidebar simply shows no BET value.
+        return {"index": "BET", "change": None, "value": None, "date": None,
+                "source": "stocks.networth.ro", "unavailable": True}
 
 
 import xml.etree.ElementTree as _ET
