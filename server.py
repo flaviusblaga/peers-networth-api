@@ -2921,6 +2921,7 @@ class EventCreate(BaseModel):
     date: Optional[str] = ""  # "YYYY-MM-DD HH:MM"
     description: Optional[str] = ""
     description_en: Optional[str] = ""
+    register_url: Optional[str] = ""
     max_seats: Optional[int] = None
     audience: Optional[str] = "all"  # "all" | "club"
 
@@ -2932,6 +2933,7 @@ class EventUpdate(BaseModel):
     date: Optional[str] = None
     description: Optional[str] = None
     description_en: Optional[str] = None
+    register_url: Optional[str] = None
     max_seats: Optional[int] = None
     audience: Optional[str] = None
 
@@ -2973,6 +2975,7 @@ def create_event(payload: EventCreate, admin_user: dict = Depends(get_admin_user
         "date": (payload.date or "").strip(),
         "description": (payload.description or "").strip(),
         "description_en": (payload.description_en or "").strip(),
+        "register_url": (payload.register_url or "").strip(),
         "max_seats": payload.max_seats,
         "audience": "club" if (payload.audience == "club") else "all",
         "rsvps": [],
@@ -3009,6 +3012,52 @@ def update_event(event_id: str, payload: EventUpdate, admin_user: dict = Depends
     ev = db.events.find_one({"id": event_id}, {"_id": 0})
     ev.pop("rsvps", None)
     return ev
+
+@api_router.get("/admin/events/{event_id}/attendees.xlsx")
+def export_event_attendees(event_id: str, current_user: dict = Depends(get_moderator_user)):
+    """Export an event's attendees as an Excel (.xlsx) file. Moderators/admins only."""
+    ev = db.events.find_one({"id": event_id})
+    if not ev:
+        raise HTTPException(status_code=404, detail="Event not found")
+    rsvps = ev.get("rsvps", [])
+    users = {u["id"]: u for u in db.users.find({"id": {"$in": rsvps}})}
+
+    from openpyxl import Workbook
+    from openpyxl.styles import Font
+    import io, re as _re
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Participanti"
+    headers = ["#", "Nume", "Email", "Titlu / Companie", "Abonament", "Oras"]
+    ws.append(headers)
+    for c in ws[1]:
+        c.font = Font(bold=True)
+    for idx, uid in enumerate(rsvps, start=1):
+        u = users.get(uid, {})
+        ws.append([
+            idx,
+            u.get("name", ""),
+            u.get("email", ""),
+            u.get("headline", ""),
+            u.get("membership_tier", ""),
+            u.get("location", ""),
+        ])
+    widths = [5, 26, 30, 30, 14, 18]
+    for i, w in enumerate(widths, start=1):
+        ws.column_dimensions[chr(64 + i)].width = w
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    slug = _re.sub(r"[^A-Za-z0-9_-]+", "-", (ev.get("title") or "event")).strip("-")[:40] or "event"
+    date_part = (ev.get("date") or "").split()[0].replace(".", "-")
+    fname = f"participanti-{slug}" + (f"-{date_part}" if date_part else "") + ".xlsx"
+    from fastapi.responses import Response as _Response
+    return _Response(
+        content=buf.read(),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )
 
 @api_router.delete("/admin/events/{event_id}")
 def delete_event(event_id: str, admin_user: dict = Depends(get_admin_user)):
