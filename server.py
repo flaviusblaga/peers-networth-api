@@ -2915,11 +2915,25 @@ def join_circle(circle_id: str, current_user: dict = Depends(get_club_user)):
 
 class EventCreate(BaseModel):
     title: str
+    title_en: Optional[str] = ""
     city: Optional[str] = ""
+    city_en: Optional[str] = ""
     date: Optional[str] = ""  # "YYYY-MM-DD HH:MM"
     description: Optional[str] = ""
+    description_en: Optional[str] = ""
     max_seats: Optional[int] = None
     audience: Optional[str] = "all"  # "all" | "club"
+
+class EventUpdate(BaseModel):
+    title: Optional[str] = None
+    title_en: Optional[str] = None
+    city: Optional[str] = None
+    city_en: Optional[str] = None
+    date: Optional[str] = None
+    description: Optional[str] = None
+    description_en: Optional[str] = None
+    max_seats: Optional[int] = None
+    audience: Optional[str] = None
 
 @api_router.get("/events")
 def list_events(audience: Optional[str] = None, current_user: dict = Depends(get_current_user)):
@@ -2930,15 +2944,16 @@ def list_events(audience: Optional[str] = None, current_user: dict = Depends(get
     elif not is_club:
         q = {"audience": {"$ne": "club"}}  # Online members don't see Club-only events
     events = list(db.events.find(q, {"_id": 0}).sort("date", 1).limit(100))
+    can_see_attendees = is_moderator(current_user)  # admins/moderators see who RSVP'd
     result = []
     for ev in events:
         rsvps = ev.get("rsvps", [])
         names = []
-        if rsvps:
-            docs = db.users.find({"id": {"$in": rsvps}}, {"name": 1, "_id": 0}).limit(50)
+        if rsvps and can_see_attendees:
+            docs = db.users.find({"id": {"$in": rsvps}}, {"name": 1, "_id": 0}).limit(200)
             names = [d.get("name", "") for d in docs]
         ev["rsvp_count"] = len(rsvps)
-        ev["attendee_names"] = names
+        ev["attendee_names"] = names  # only populated for moderators
         ev["me"] = current_user["id"] in rsvps
         ev.pop("rsvps", None)
         result.append(ev)
@@ -2952,9 +2967,12 @@ def create_event(payload: EventCreate, admin_user: dict = Depends(get_admin_user
     doc = {
         "id": str(uuid.uuid4()),
         "title": title,
+        "title_en": (payload.title_en or "").strip(),
         "city": (payload.city or "").strip(),
+        "city_en": (payload.city_en or "").strip(),
         "date": (payload.date or "").strip(),
         "description": (payload.description or "").strip(),
+        "description_en": (payload.description_en or "").strip(),
         "max_seats": payload.max_seats,
         "audience": "club" if (payload.audience == "club") else "all",
         "rsvps": [],
@@ -2965,6 +2983,32 @@ def create_event(payload: EventCreate, admin_user: dict = Depends(get_admin_user
     db.events.insert_one(doc)
     doc.pop("_id", None)
     return doc
+
+@api_router.patch("/admin/events/{event_id}")
+def update_event(event_id: str, payload: EventUpdate, admin_user: dict = Depends(get_admin_user)):
+    data = payload.dict(exclude_unset=True)
+    updates = {}
+    for k, v in data.items():
+        if k == "title":
+            if v is None or not v.strip():
+                raise HTTPException(status_code=400, detail="Event title is required")
+            updates[k] = v.strip()
+        elif k == "audience":
+            updates[k] = "club" if v == "club" else "all"
+        elif k == "max_seats":
+            updates[k] = v
+        elif isinstance(v, str):
+            updates[k] = v.strip()
+        else:
+            updates[k] = v
+    if not updates:
+        raise HTTPException(status_code=400, detail="No fields to update")
+    result = db.events.update_one({"id": event_id}, {"$set": updates})
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Event not found")
+    ev = db.events.find_one({"id": event_id}, {"_id": 0})
+    ev.pop("rsvps", None)
+    return ev
 
 @api_router.delete("/admin/events/{event_id}")
 def delete_event(event_id: str, admin_user: dict = Depends(get_admin_user)):
